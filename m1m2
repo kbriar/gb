@@ -1,0 +1,305 @@
+# ---- Install required packages ----
+!pip install --quiet google-genai gspread sentence-transformers faiss-cpu langgraph pyyaml
+
+import json
+import pandas as pd
+from datetime import datetime, timedelta
+from dateutil.relativedelta import relativedelta
+import re
+import yaml
+from sentence_transformers import SentenceTransformer
+import faiss
+from google.colab import auth
+import gspread
+from google.auth import default
+from google import genai
+
+# ---- Semantic Layer Loader ----
+def load_semantic_layer(path: str):
+    with open(path, 'r') as f:
+        return yaml.safe_load(f)
+
+# ---- Normalize DataFrame Columns ----
+def normalize_columns(df):
+    df.columns = [col.strip() for col in df.columns]
+    return df
+
+# ---- Semantic Mapping (Case/Whitespace Insensitive) ----
+def map_semantic_to_column(entity, semantic_layer, df_columns):
+    entity_norm = entity.strip().lower()
+    df_col_lookup = {col.strip().lower(): col for col in df_columns}
+    for col, meta in semantic_layer["tables"]["efficiency_table"]["columns"].items():
+        sem = meta.get("semantic")
+        if isinstance(sem, list):
+            if any(entity_norm == s.strip().lower() for s in sem):
+                return df_col_lookup.get(col.strip().lower(), col)
+        elif isinstance(sem, str):
+            if entity_norm == sem.strip().lower():
+                return df_col_lookup.get(col.strip().lower(), col)
+    if entity_norm in df_col_lookup:
+        return df_col_lookup[entity_norm]
+    raise ValueError(f"Could not map entity '{entity}' to any DataFrame column.")
+
+# ---- Date Range Logic ----
+def month_start_end(date):
+    start = date.replace(day=1)
+    end = (start + relativedelta(day=31))
+    return start, end
+
+def year_start_end(date):
+    start = date.replace(month=1, day=1)
+    end = date.replace(month=12, day=31)
+    return start, end
+
+def week_start_end(date):
+    start = date - timedelta(days=date.weekday())
+    end = start + timedelta(days=6)
+    return start, end
+
+def get_date_range_from_timeframe(timeframe: str, reference_date: datetime):
+    tf = timeframe.strip().lower()
+    if tf in ['today', 'as of today']:
+        return reference_date, reference_date
+    if tf in ['yesterday', 'as of yesterday']:
+        day = reference_date - timedelta(days=1)
+        return day, day
+    if tf in ['as of last week', 'as of previous week']:
+        last_week_start = reference_date - timedelta(days=reference_date.weekday() + 7)
+        last_week_end = last_week_start + timedelta(days=6)
+        return last_week_start, last_week_end
+    if tf in ['as of last month', 'as of previous month']:
+        last_month = (reference_date.replace(day=1) - relativedelta(months=1))
+        return month_start_end(last_month)
+    if tf == 'this week':
+        return week_start_end(reference_date)
+    if tf in ['last week', 'previous week']:
+        last_week_date = reference_date - timedelta(days=7)
+        return week_start_end(last_week_date)
+    if tf == 'this month':
+        return month_start_end(reference_date)
+    if tf == 'last month':
+        last_month = (reference_date.replace(day=1) - relativedelta(months=1))
+        return month_start_end(last_month)
+    if tf == 'this year':
+        return year_start_end(reference_date)
+    if tf == 'last year':
+        last_year = reference_date.replace(month=1, day=1) - relativedelta(years=1)
+        return year_start_end(last_year)
+    match = re.match(r'(\d+)(st|nd|rd|th) week of this month', tf)
+    if match:
+        week_num = int(match.group(1))
+        month_start = reference_date.replace(day=1)
+        start = month_start + timedelta(days=(week_num - 1) * 7)
+        end = start + timedelta(days=6)
+        _, month_end = month_start_end(reference_date)
+        if end > month_end:
+            end = month_end
+        return start, end
+    if len(tf) == 7 and re.match(r'\d{4}-\d{2}', tf):
+        month_date = pd.to_datetime(tf + '-01')
+        return month_start_end(month_date)
+    if len(tf) == 10 and re.match(r'\d{4}-\d{2}-\d{2}', tf):
+        day = pd.to_datetime(tf)
+        return day, day
+    if tf.startswith('week of'):
+        date_str = tf.replace('week of', '').strip()
+        start = pd.to_datetime(date_str)
+        end = start + timedelta(days=6)
+        return start, end
+    raise ValueError(f"Unknown timeframe format: {timeframe}")
+
+# ---- Module 1: Gemini LLM Client ----
+class GeminiLLMClient:
+    def __init__(self, api_key: str, model: str = "gemini-2.5-flash"):
+        self.client = genai.Client(api_key=api_key)
+        self.model = model
+
+    def extract_context(self, user_query: str, intent_list):
+        prompt = (
+            f"Extract the following from the query: intent (choose from {intent_list}), "
+            "entities (country, VID, week_date, month, etc.), metrics, and timeframes. "
+            "Respond in JSON. Query: " + user_query
+        )
+        config = {
+            "response_mime_type": "application/json"
+        }
+        response = self.client.models.generate_content(
+            model=self.model,
+            contents=prompt,
+            config=config
+        )
+        try:
+            context = json.loads(response.text)
+        except Exception as e:
+            print(f"Error parsing JSON from Gemini response: {e}\nRaw response: {response.text}")
+            context = {"intent": None, "entities": {}, "metrics": [], "timeframes": []}
+        return context
+
+# ---- Module 1: Context Window with FAISS ----
+class ContextWindow:
+    def __init__(self, embedding_model: str = "all-MiniLM-L6-v2"):
+        self.model = SentenceTransformer(embedding_model)
+        self.index = None
+        self.contexts = []
+
+    def add_context(self, context):
+        text = json.dumps(context)
+        embedding = self.model.encode([text])
+        if self.index is None:
+            self.index = faiss.IndexFlatL2(embedding.shape[1])
+        self.index.add(embedding)
+        self.contexts.append(context)
+
+    def search_similar(self, query, top_k=3):
+        embedding = self.model.encode([query])
+        if self.index is None or self.index.ntotal == 0:
+            return []
+        D, I = self.index.search(embedding, top_k)
+        return [self.contexts[i] for i in I[0] if i < len(self.contexts)]
+
+# ---- Module 1: Query Understanding Agent ----
+class QueryUnderstandingAgent:
+    def __init__(self, gemini_client, context_window, intent_list):
+        self.gemini_client = gemini_client
+        self.context_window = context_window
+        self.intent_list = intent_list
+
+    def __call__(self, state):
+        user_query = state.get("user_query")
+        extracted_context = self.gemini_client.extract_context(user_query, self.intent_list)
+        self.context_window.add_context(extracted_context)
+        similar_contexts = self.context_window.search_similar(user_query)
+        state.update({
+            "extracted_context": extracted_context,
+            "similar_contexts": similar_contexts
+        })
+        return state
+
+# ---- Module 2: Data Retrieval Agent ----
+class DataRetrievalAgent:
+    def __init__(self, semantic_layer, reference_date=None):
+        self.semantic_layer = semantic_layer
+        self.reference_date = reference_date or datetime.now()
+
+    def retrieve(self, df, extracted_context):
+        entities = extracted_context.get("entities", {})
+        timeframes = extracted_context.get("timeframes", [])
+        filters = []
+
+        df = normalize_columns(df)
+
+        for key, val in entities.items():
+            col = map_semantic_to_column(key, self.semantic_layer, df.columns)
+            if col not in df.columns:
+                raise ValueError(f"Column '{col}' not found in DataFrame. Available columns: {df.columns.tolist()}")
+            filters.append(df[col].astype(str) == str(val))
+
+        if "drive_date" not in df.columns:
+            raise ValueError("Column 'drive_date' not found in DataFrame.")
+        df["drive_date"] = pd.to_datetime(df["drive_date"])
+        date_mask = pd.Series([False] * len(df))
+        for timeframe in timeframes:
+            start, end = get_date_range_from_timeframe(timeframe, self.reference_date)
+            date_mask = date_mask | ((df["drive_date"] >= start) & (df["drive_date"] <= end))
+        if timeframes:
+            filters.append(date_mask)
+
+        if filters:
+            mask = filters[0]
+            for f in filters[1:]:
+                mask = mask & f
+            filtered_df = df[mask].copy()
+        else:
+            filtered_df = df.copy()
+
+        return filtered_df
+
+    def build_sql_query(self, extracted_context):
+        entities = extracted_context.get("entities", {})
+        timeframes = extracted_context.get("timeframes", [])
+        where_clauses = []
+        for key, val in entities.items():
+            col = map_semantic_to_column(key, self.semantic_layer, [col for col in self.semantic_layer["tables"]["efficiency_table"]["columns"].keys()])
+            where_clauses.append(f"{col} = '{val}'")
+        for timeframe in timeframes:
+            start, end = get_date_range_from_timeframe(timeframe, self.reference_date)
+            where_clauses.append(f"drive_date BETWEEN '{start.date()}' AND '{end.date()}'")
+        where_sql = " AND ".join(where_clauses)
+        sql = f"SELECT * FROM efficiency_table WHERE {where_sql}"
+        return sql
+
+# ---- LangGraph Orchestration ----
+from langgraph.graph import StateGraph, START, END
+
+class PipelineState(dict):
+    pass
+
+def module1_node(state: PipelineState):
+    # Module 1: Query Understanding
+    state = query_agent(state)
+    print("\n--- Module 1 Output (Extracted Context) ---")
+    print(state["extracted_context"])
+    print("--- Module 1 Output (Similar Contexts) ---")
+    print(state["similar_contexts"])
+    return state
+
+def module2_node(state: PipelineState):
+    # Module 2: Data Retrieval
+    filtered_df = data_retrieval_agent.retrieve(df, state["extracted_context"])
+    sql_query = data_retrieval_agent.build_sql_query(state["extracted_context"])
+    print("\n--- Module 2 Output (Filtered DataFrame) ---")
+    print(filtered_df)
+    print("\n--- Module 2 Output (SQL Query) ---")
+    print(sql_query)
+    state["filtered_df"] = filtered_df
+    state["sql_query"] = sql_query
+    return state
+
+# ---- Example Usage (End-to-End Flow) ----
+
+# 1. Load semantic layer from YAML file
+semantic_layer = load_semantic_layer("semantic_layer.yaml")
+
+# 2. Load your data from Google Sheets as DataFrame (df)
+auth.authenticate_user()
+creds, _ = default()
+gc = gspread.authorize(creds)
+sheet_url = "https://docs.google.com/spreadsheets/d/your-sheet-id/edit#gid=0"  # <-- update with your sheet
+sh = gc.open_by_url(sheet_url)
+worksheet = sh.sheet1
+data = worksheet.get_all_records()
+df = pd.DataFrame(data)
+
+# 3. Set up Module 1
+GEMINI_API_KEY = "YOUR_GEMINI_API_KEY"  # <-- Replace with your key
+INTENT_LIST = [
+    "fetch_metric", "compare_metric", "rank_entities",
+    "diagnose_metric", "root_cause_analysis", "trend_analysis",
+    "threshold_check", "list_entities_by_criteria", "summarize_metric", "get_recommendation"
+]
+gemini_client = GeminiLLMClient(GEMINI_API_KEY)
+context_window = ContextWindow()
+query_agent = QueryUnderstandingAgent(gemini_client, context_window, INTENT_LIST)
+
+# 4. Set up Module 2
+data_retrieval_agent = DataRetrievalAgent(semantic_layer, reference_date=datetime(2025, 7, 2))
+
+# 5. Build LangGraph workflow
+graph = StateGraph(PipelineState)
+graph.add_node("module1", module1_node)
+graph.add_node("module2", module2_node)
+graph.add_edge(START, "module1")
+graph.add_edge("module1", "module2")
+graph.add_edge("module2", END)
+app = graph.compile()
+
+# 6. Run the pipeline
+user_query = "What is the efficiency for VID 12345 in the month of May 2025?"
+initial_state = PipelineState(user_query=user_query)
+final_state = app.invoke(initial_state)
+
+# You can now access:
+# final_state["extracted_context"]  # Module 1 output
+# final_state["similar_contexts"]   # Module 1 vector search
+# final_state["filtered_df"]        # Module 2 output
+# final_state["sql_query"]          # Module 2 SQL
