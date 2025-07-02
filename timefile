@@ -1,0 +1,130 @@
+import pandas as pd
+from datetime import datetime, timedelta
+from dateutil.relativedelta import relativedelta
+import re
+
+CURRENT_DATE = datetime(2025, 7, 2)
+
+def month_start_end(date):
+    start = date.replace(day=1)
+    end = (start + relativedelta(day=31))
+    return start, end
+
+def year_start_end(date):
+    start = date.replace(month=1, day=1)
+    end = date.replace(month=12, day=31)
+    return start, end
+
+def week_start_end(date):
+    start = date - timedelta(days=date.weekday())
+    end = start + timedelta(days=6)
+    return start, end
+
+def get_date_range_from_timeframe(timeframe: str, reference_date: datetime = CURRENT_DATE):
+    tf = timeframe.strip().lower()
+
+    # "as of today"
+    if tf in ['today', 'as of today']:
+        return reference_date, reference_date
+
+    # "as of yesterday"
+    if tf in ['yesterday', 'as of yesterday']:
+        day = reference_date - timedelta(days=1)
+        return day, day
+
+    # "as of last week" or "as of previous week"
+    if tf in ['as of last week', 'as of previous week']:
+        last_week_start = reference_date - timedelta(days=reference_date.weekday() + 7)
+        last_week_end = last_week_start + timedelta(days=6)
+        return last_week_start, last_week_end
+
+    # "as of last month" or "as of previous month"
+    if tf in ['as of last month', 'as of previous month']:
+        last_month = (reference_date.replace(day=1) - relativedelta(months=1))
+        return month_start_end(last_month)
+
+    # "this week"
+    if tf == 'this week':
+        return week_start_end(reference_date)
+
+    # "last week" or "previous week"
+    if tf in ['last week', 'previous week']:
+        last_week_date = reference_date - timedelta(days=7)
+        return week_start_end(last_week_date)
+
+    # "this month"
+    if tf == 'this month':
+        return month_start_end(reference_date)
+
+    # "last month"
+    if tf == 'last month':
+        last_month = (reference_date.replace(day=1) - relativedelta(months=1))
+        return month_start_end(last_month)
+
+    # "this year"
+    if tf == 'this year':
+        return year_start_end(reference_date)
+
+    # "last year"
+    if tf == 'last year':
+        last_year = reference_date.replace(month=1, day=1) - relativedelta(years=1)
+        return year_start_end(last_year)
+
+    # "N-th week of this month"
+    match = re.match(r'(\d+)(st|nd|rd|th) week of this month', tf)
+    if match:
+        week_num = int(match.group(1))
+        month_start = reference_date.replace(day=1)
+        start = month_start + timedelta(days=(week_num - 1) * 7)
+        end = start + timedelta(days=6)
+        # Ensure end does not go beyond month end
+        _, month_end = month_start_end(reference_date)
+        if end > month_end:
+            end = month_end
+        return start, end
+
+    # Explicit month: '2025-05'
+    if len(tf) == 7 and re.match(r'\d{4}-\d{2}', tf):
+        month_date = pd.to_datetime(tf + '-01')
+        return month_start_end(month_date)
+
+    # Explicit day: '2025-06-10'
+    if len(tf) == 10 and re.match(r'\d{4}-\d{2}-\d{2}', tf):
+        day = pd.to_datetime(tf)
+        return day, day
+
+    # 'week of 2025-06-06'
+    if tf.startswith('week of'):
+        date_str = tf.replace('week of', '').strip()
+        start = pd.to_datetime(date_str)
+        end = start + timedelta(days=6)
+        return start, end
+
+    raise ValueError(f"Unknown timeframe format: {timeframe}")
+
+# -- Test cases --
+examples = [
+    'as of today',
+    'as of yesterday',
+    'as of last week',
+    'as of previous week',
+    'as of last month',
+    'as of previous month',
+    'this week',
+    'last week',
+    'this month',
+    'last month',
+    'this year',
+    'last year',
+    '2nd week of this month',
+    '2025-05',
+    '2025-06-10',
+    'week of 2025-06-06'
+]
+
+for ex in examples:
+    try:
+        start, end = get_date_range_from_timeframe(ex)
+        print(f"{ex}: {start.date()} to {end.date()}")
+    except Exception as e:
+        print(f"{ex}: {e}")
