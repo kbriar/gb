@@ -1,0 +1,608 @@
+# ---- Install required packages ----
+!pip install --quiet google-genai gspread sentence-transformers faiss-cpu langgraph pyyaml
+
+import json
+import pandas as pd
+from datetime import datetime, timedelta
+from dateutil.relativedelta import relativedelta
+import re
+import yaml
+from sentence_transformers import SentenceTransformer
+import faiss
+from google.colab import auth
+import gspread
+from google.auth import default
+from google import genai
+
+# ---- Semantic Layer Loader ----
+def load_semantic_layer(path: str):
+    with open(path, 'r') as f:
+        return yaml.safe_load(f)
+
+# ---- Normalize DataFrame Columns ----
+def normalize_columns(df):
+    df.columns = [col.strip() for col in df.columns]
+    return df
+
+# ---- Semantic Mapping (Case/Whitespace Insensitive) ----
+def map_semantic_to_column(entity, semantic_layer, df_columns):
+    entity_norm = entity.strip().lower()
+    df_col_lookup = {col.strip().lower(): col for col in df_columns}
+    
+    # Check semantic layer mappings
+    for col, meta in semantic_layer["tables"]["efficiency_table"]["columns"].items():
+        sem = meta.get("semantic", [])
+        if isinstance(sem, list):
+            if any(entity_norm == s.strip().lower() for s in sem):
+                return df_col_lookup.get(col.strip().lower(), col)
+        elif isinstance(sem, str):
+            if entity_norm == sem.strip().lower():
+                return df_col_lookup.get(col.strip().lower(), col)
+    
+    # Direct column name match
+    if entity_norm in df_col_lookup:
+        return df_col_lookup[entity_norm]
+    
+    # If no mapping found, return None
+    print(f"Warning: Could not map entity '{entity}' to any DataFrame column. Skipping this entity.")
+    return None
+
+# ---- Enhanced Date Range Logic ----
+def month_start_end(date):
+    start = date.replace(day=1)
+    end = (start + relativedelta(day=31))
+    return start, end
+
+def year_start_end(date):
+    start = date.replace(month=1, day=1)
+    end = date.replace(month=12, day=31)
+    return start, end
+
+def week_start_end(date):
+    start = date - timedelta(days=date.weekday())
+    end = start + timedelta(days=6)
+    return start, end
+
+def get_date_range_from_timeframe(timeframe: str, reference_date: datetime):
+    """
+    Parse timeframe and return date range for drive_date filtering
+    """
+    tf = timeframe.strip().lower()
+    
+    # Current time references
+    if tf in ['today', 'as of today']:
+        return reference_date, reference_date
+    if tf in ['yesterday', 'as of yesterday']:
+        day = reference_date - timedelta(days=1)
+        return day, day
+    
+    # Week references
+    if tf in ['as of last week', 'as of previous week']:
+        last_week_start = reference_date - timedelta(days=reference_date.weekday() + 7)
+        last_week_end = last_week_start + timedelta(days=6)
+        return last_week_start, last_week_end
+    if tf == 'this week':
+        return week_start_end(reference_date)
+    if tf in ['last week', 'previous week']:
+        last_week_date = reference_date - timedelta(days=7)
+        return week_start_end(last_week_date)
+    
+    # Month references
+    if tf in ['as of last month', 'as of previous month']:
+        last_month = (reference_date.replace(day=1) - relativedelta(months=1))
+        return month_start_end(last_month)
+    if tf == 'this month':
+        return month_start_end(reference_date)
+    if tf == 'last month':
+        last_month = (reference_date.replace(day=1) - relativedelta(months=1))
+        return month_start_end(last_month)
+    
+    # Year references - these should filter by drive_date
+    if tf == 'this year':
+        return year_start_end(reference_date)
+    if tf == 'last year':
+        last_year = reference_date.replace(month=1, day=1) - relativedelta(years=1)
+        return year_start_end(last_year)
+    
+    # Specific year like "2025" or "year 2025"
+    year_match = re.match(r'(?:year\s+)?(\d{4})$', tf)
+    if year_match:
+        year = int(year_match.group(1))
+        start_date = datetime(year, 1, 1)
+        end_date = datetime(year, 12, 31)
+        return start_date, end_date
+    
+    # Specific month-year combinations like "May 2025"
+    month_year_match = re.match(r'([a-zA-Z]+)\s+(\d{4})', tf)
+    if month_year_match:
+        month_name, year = month_year_match.groups()
+        try:
+            # Try full month name first
+            month_num = pd.to_datetime(month_name, format='%B').month
+            start_date = datetime(int(year), month_num, 1)
+            return month_start_end(start_date)
+        except:
+            try:
+                # Try abbreviated month name
+                month_num = pd.to_datetime(month_name, format='%b').month
+                start_date = datetime(int(year), month_num, 1)
+                return month_start_end(start_date)
+            except:
+                pass
+    
+    # Specific week patterns
+    match = re.match(r'(\d+)(st|nd|rd|th) week of this month', tf)
+    if match:
+        week_num = int(match.group(1))
+        month_start = reference_date.replace(day=1)
+        start = month_start + timedelta(days=(week_num - 1) * 7)
+        end = start + timedelta(days=6)
+        _, month_end = month_start_end(reference_date)
+        if end > month_end:
+            end = month_end
+        return start, end
+    
+    # Date formats
+    if len(tf) == 7 and re.match(r'\d{4}-\d{2}', tf):
+        month_date = pd.to_datetime(tf + '-01')
+        return month_start_end(month_date)
+    if len(tf) == 10 and re.match(r'\d{4}-\d{2}-\d{2}', tf):
+        day = pd.to_datetime(tf)
+        return day, day
+    if tf.startswith('week of'):
+        date_str = tf.replace('week of', '').strip()
+        start = pd.to_datetime(date_str)
+        end = start + timedelta(days=6)
+        return start, end
+    
+    print(f"Warning: Unknown timeframe format for date filtering: {timeframe}")
+    return None, None
+
+def is_season_reference(timeframe: str):
+    """
+    Check if timeframe refers to a season (should use season_name column)
+    """
+    tf = timeframe.strip().lower()
+    return tf.startswith('season') or 'season' in tf
+
+def get_season_value(timeframe: str):
+    """
+    Extract season value from timeframe for season_name filtering
+    """
+    tf = timeframe.strip()
+    
+    # Extract year from season references like "season 2025" or "season year 2025"
+    season_match = re.search(r'season\s+(?:year\s+)?(\d{4})', tf, re.IGNORECASE)
+    if season_match:
+        return season_match.group(1)
+    
+    # If just "season" is mentioned, might need more context
+    if tf.lower() == 'season':
+        return None
+    
+    return None
+
+# ---- Module 1: Enhanced Gemini LLM Client ----
+class GeminiLLMClient:
+    def __init__(self, api_key: str, model: str = "gemini-2.5-flash"):
+        self.client = genai.Client(api_key=api_key)
+        self.model = model
+
+    def extract_context(self, user_query: str, intent_list):
+        if not user_query or not isinstance(user_query, str) or len(user_query.strip()) == 0:
+            raise ValueError(f"user_query must be a non-empty string. Received: {repr(user_query)}")
+        
+        prompt = f"""Extract the following from the query and respond in JSON format:
+
+1. intent: Choose from {intent_list}
+2. entities: Extract specific values for filtering (like vehicle_id, country_code, region, user_email, etc.)
+3. metrics: What metrics are being asked for (efficiency, TKM, Total_KM, SOH, etc.)
+4. timeframes: Extract time-related expressions. Important distinctions:
+   - For year references like "2025", "year 2025", "in 2025" → use for date filtering
+   - For season references like "season 2025", "season year 2025" → use for season filtering
+   - For months like "May 2025", "this month", "last month" → use for date filtering
+
+Examples:
+- "VID 12345 in May 2025" → entities: {{"vehicle_id": "12345"}}, timeframes: ["May 2025"]
+- "efficiency for season 2025" → metrics: ["efficiency"], timeframes: ["season 2025"]
+- "data for 2025" → timeframes: ["2025"]
+
+Query: {user_query.strip()}
+
+Respond with JSON containing: intent, entities, metrics, timeframes"""
+
+        config = {"response_mime_type": "application/json"}
+        
+        try:
+            response = self.client.models.generate_content(
+                model=self.model,
+                contents=prompt,
+                config=config
+            )
+            context = json.loads(response.text)
+            
+            # Ensure all required keys exist
+            context.setdefault("intent", None)
+            context.setdefault("entities", {})
+            context.setdefault("metrics", [])
+            context.setdefault("timeframes", [])
+            
+        except Exception as e:
+            print(f"Error with Gemini API or JSON parsing: {e}")
+            if 'response' in locals():
+                print(f"Raw response: {response.text}")
+            # Return default structure
+            context = {"intent": None, "entities": {}, "metrics": [], "timeframes": []}
+        
+        return context
+
+# ---- Module 1: Context Window with FAISS ----
+class ContextWindow:
+    def __init__(self, embedding_model: str = "all-MiniLM-L6-v2"):
+        self.model = SentenceTransformer(embedding_model)
+        self.index = None
+        self.contexts = []
+
+    def add_context(self, context):
+        text = json.dumps(context)
+        embedding = self.model.encode([text])
+        if self.index is None:
+            self.index = faiss.IndexFlatL2(embedding.shape[1])
+        self.index.add(embedding)
+        self.contexts.append(context)
+
+    def search_similar(self, query, top_k=3):
+        embedding = self.model.encode([query])
+        if self.index is None or self.index.ntotal == 0:
+            return []
+        D, I = self.index.search(embedding, top_k)
+        return [self.contexts[i] for i in I[0] if i < len(self.contexts)]
+
+# ---- Module 1: Query Understanding Agent ----
+class QueryUnderstandingAgent:
+    def __init__(self, gemini_client, context_window, intent_list):
+        self.gemini_client = gemini_client
+        self.context_window = context_window
+        self.intent_list = intent_list
+
+    def __call__(self, state):
+        print(f"QueryUnderstandingAgent received state: {state}")
+        
+        user_query = state.get("user_query")
+        if not user_query:
+            raise ValueError("user_query missing in state or is empty")
+        
+        extracted_context = self.gemini_client.extract_context(user_query, self.intent_list)
+        self.context_window.add_context(extracted_context)
+        similar_contexts = self.context_window.search_similar(user_query)
+        
+        state["extracted_context"] = extracted_context
+        state["similar_contexts"] = similar_contexts
+        
+        return state
+
+# ---- Module 2: Enhanced Data Retrieval Agent ----
+class DataRetrievalAgent:
+    def __init__(self, semantic_layer, reference_date=None):
+        self.semantic_layer = semantic_layer
+        self.reference_date = reference_date or datetime.now()
+
+    def retrieve(self, df, extracted_context):
+        entities = extracted_context.get("entities", {})
+        timeframes = extracted_context.get("timeframes", [])
+        filters = []
+
+        df = normalize_columns(df)
+        print(f"DataFrame columns: {df.columns.tolist()}")
+        print(f"Entities to filter: {entities}")
+        print(f"Timeframes to process: {timeframes}")
+
+        # Process entities - map to actual DataFrame columns
+        for key, val in entities.items():
+            col = map_semantic_to_column(key, self.semantic_layer, df.columns)
+            if col is None:
+                continue
+            if col not in df.columns:
+                print(f"Warning: Column '{col}' not found in DataFrame.")
+                continue
+            
+            # Handle different data types
+            if df[col].dtype == 'object':
+                filters.append(df[col].astype(str).str.lower() == str(val).lower())
+            else:
+                filters.append(df[col] == val)
+            print(f"Applied filter: {col} = {val}")
+
+        # Process timeframes
+        date_filters = []
+        season_filters = []
+        
+        for timeframe in timeframes:
+            if is_season_reference(timeframe):
+                # Handle season filtering
+                season_value = get_season_value(timeframe)
+                if season_value and 'season_name' in df.columns:
+                    season_filters.append(df['season_name'].astype(str) == str(season_value))
+                    print(f"Applied season filter: season_name = {season_value}")
+            else:
+                # Handle date filtering
+                if 'drive_date' in df.columns:
+                    try:
+                        start, end = get_date_range_from_timeframe(timeframe, self.reference_date)
+                        if start is not None and end is not None:
+                            df['drive_date'] = pd.to_datetime(df['drive_date'])
+                            date_filter = (df['drive_date'] >= start) & (df['drive_date'] <= end)
+                            date_filters.append(date_filter)
+                            print(f"Applied date filter for '{timeframe}': {start.date()} to {end.date()}")
+                    except Exception as e:
+                        print(f"Error processing timeframe '{timeframe}': {e}")
+
+        # Combine all filters
+        all_filters = filters + date_filters + season_filters
+        
+        if all_filters:
+            combined_mask = all_filters[0]
+            for f in all_filters[1:]:
+                combined_mask = combined_mask & f
+            filtered_df = df[combined_mask].copy()
+        else:
+            filtered_df = df.copy()
+
+        print(f"Original DataFrame shape: {df.shape}")
+        print(f"Filtered DataFrame shape: {filtered_df.shape}")
+        
+        return filtered_df
+
+    def build_sql_query(self, extracted_context):
+        entities = extracted_context.get("entities", {})
+        timeframes = extracted_context.get("timeframes", [])
+        where_clauses = []
+        
+        # Process entities
+        for key, val in entities.items():
+            col = map_semantic_to_column(key, self.semantic_layer, 
+                                       [col for col in self.semantic_layer["tables"]["efficiency_table"]["columns"].keys()])
+            if col is None:
+                continue
+            where_clauses.append(f"{col} = '{val}'")
+        
+        # Process timeframes
+        for timeframe in timeframes:
+            if is_season_reference(timeframe):
+                season_value = get_season_value(timeframe)
+                if season_value:
+                    where_clauses.append(f"season_name = '{season_value}'")
+            else:
+                try:
+                    start, end = get_date_range_from_timeframe(timeframe, self.reference_date)
+                    if start is not None and end is not None:
+                        where_clauses.append(f"drive_date BETWEEN '{start.date()}' AND '{end.date()}'")
+                except Exception as e:
+                    print(f"Error processing timeframe '{timeframe}' for SQL: {e}")
+        
+        if where_clauses:
+            where_sql = " AND ".join(where_clauses)
+            sql = f"SELECT * FROM efficiency_table WHERE {where_sql}"
+        else:
+            sql = "SELECT * FROM efficiency_table"
+        
+        return sql
+
+# ---- LangGraph Orchestration ----
+from langgraph.graph import StateGraph, START, END
+from typing import TypedDict, Any
+
+class PipelineState(TypedDict):
+    user_query: str
+    extracted_context: dict
+    similar_contexts: list
+    filtered_df: Any
+    sql_query: str
+
+def module1_node(state: PipelineState) -> PipelineState:
+    print(f"Module1 node received state keys: {list(state.keys())}")
+    
+    if "user_query" not in state or not state["user_query"]:
+        raise ValueError("user_query missing in module1_node")
+    
+    updated_state = query_agent(state)
+    
+    print("\n--- Module 1 Output (Extracted Context) ---")
+    print(json.dumps(updated_state["extracted_context"], indent=2))
+    
+    return updated_state
+
+def module2_node(state: PipelineState) -> PipelineState:
+    print(f"Module2 node received state keys: {list(state.keys())}")
+    
+    if "extracted_context" not in state:
+        raise ValueError("extracted_context missing from state in module2_node")
+    
+    filtered_df = data_retrieval_agent.retrieve(df, state["extracted_context"])
+    sql_query = data_retrieval_agent.build_sql_query(state["extracted_context"])
+    
+    print("\n--- Module 2 Output (Filtered DataFrame) ---")
+    print(filtered_df.head() if len(filtered_df) > 0 else "No data found")
+    print(f"Total rows: {len(filtered_df)}")
+    print("\n--- Module 2 Output (SQL Query) ---")
+    print(sql_query)
+    
+    state["filtered_df"] = filtered_df
+    state["sql_query"] = sql_query
+    
+    return state
+
+# ---- Example Usage (End-to-End Flow) ----
+
+# 1. Load semantic layer
+try:
+    semantic_layer = load_semantic_layer("semantic_layer.yaml")
+    print("✓ Loaded semantic layer from file")
+except FileNotFoundError:
+    print("Warning: semantic_layer.yaml not found. Using built-in semantic layer.")
+    semantic_layer = {
+        "tables": {
+            "efficiency_table": {
+                "description": "Main table for efficiency and operational analysis",
+                "columns": {
+                    "vehicle_id": {
+                        "description": "Unique vehicle identifier",
+                        "type": "string",
+                        "semantic": ["VID", "vehicle_id", "vehicle", "id"]
+                    },
+                    "country_code": {
+                        "description": "Country code",
+                        "type": "string",
+                        "semantic": ["country", "country_code", "nation"]
+                    },
+                    "region": {
+                        "description": "Geographic region",
+                        "type": "string",
+                        "semantic": ["region"]
+                    },
+                    "drive_date": {
+                        "description": "Date of drive (YYYY-MM-DD)",
+                        "type": "date",
+                        "semantic": ["drive_date", "date", "trip_date"]
+                    },
+                    "drive_month": {
+                        "description": "Month of drive (YYYY-MM-01)",
+                        "type": "date",
+                        "semantic": ["drive_month", "month"]
+                    },
+                    "TKM": {
+                        "description": "Target kilometers",
+                        "type": "float",
+                        "semantic": ["TKM", "target_km", "target_kilometers"]
+                    },
+                    "Total_KM": {
+                        "description": "Total kilometers",
+                        "type": "float",
+                        "semantic": ["Total_KM", "total_km", "total_kilometers"]
+                    },
+                    "SOH": {
+                        "description": "Hours logged",
+                        "type": "float",
+                        "semantic": ["SOH", "hours_logged", "state_of_hours"]
+                    },
+                    "cause": {
+                        "description": "Root cause for low efficiency",
+                        "type": "string",
+                        "semantic": ["cause", "root_cause", "reason"]
+                    },
+                    "recommendation": {
+                        "description": "Improvement suggestion",
+                        "type": "string",
+                        "semantic": ["recommendation", "suggestion", "improvement"]
+                    },
+                    "season_name": {
+                        "description": "Season or year",
+                        "type": "string",
+                        "semantic": ["season", "season_name", "season_year"]
+                    },
+                    "user_email": {
+                        "description": "Driver/user email",
+                        "type": "string",
+                        "semantic": ["user_email", "driver_email", "email"]
+                    }
+                }
+            }
+        }
+    }
+
+# 2. Load data (sample data for testing)
+try:
+    auth.authenticate_user()
+    creds, _ = default()
+    gc = gspread.authorize(creds)
+    sheet_url = "YOUR_SHEET_URL_HERE"  # Replace with your actual sheet URL
+    sh = gc.open_by_url(sheet_url)
+    worksheet = sh.sheet1
+    data = worksheet.get_all_records()
+    df = pd.DataFrame(data)
+    print("✓ Loaded data from Google Sheets")
+except Exception as e:
+    print(f"Warning: Could not load from Google Sheets: {e}")
+    print("Creating sample DataFrame for testing...")
+    df = pd.DataFrame({
+        'vehicle_id': ['12345', '67890', '12345', '99999'],
+        'country_code': ['US', 'US', 'US', 'CA'],
+        'region': ['West', 'East', 'West', 'Central'],
+        'drive_date': ['2025-05-15', '2025-05-16', '2025-06-10', '2025-05-20'],
+        'drive_month': ['2025-05-01', '2025-05-01', '2025-06-01', '2025-05-01'],
+        'TKM': [100, 150, 120, 200],
+        'Total_KM': [120, 160, 140, 250],
+        'SOH': [8, 9, 7, 10],
+        'cause': ['Traffic', 'None', 'Weather', 'None'],
+        'recommendation': ['Route optimization', 'Continue', 'Weather planning', 'Continue'],
+        'season_name': ['2025', '2025', '2025', '2025'],
+        'user_email': ['driver1@test.com', 'driver2@test.com', 'driver1@test.com', 'driver3@test.com']
+    })
+
+# 3. Initialize components
+GEMINI_API_KEY = "YOUR_GEMINI_API_KEY_HERE"  # Replace with your actual API key
+INTENT_LIST = [
+    "fetch_metric", "compare_metric", "rank_entities",
+    "diagnose_metric", "root_cause_analysis", "trend_analysis",
+    "threshold_check", "list_entities_by_criteria", "summarize_metric", "get_recommendation"
+]
+
+try:
+    gemini_client = GeminiLLMClient(GEMINI_API_KEY)
+    print("✓ Initialized Gemini client")
+except Exception as e:
+    print(f"Error initializing Gemini client: {e}")
+    print("Please set your GEMINI_API_KEY correctly")
+
+context_window = ContextWindow()
+query_agent = QueryUnderstandingAgent(gemini_client, context_window, INTENT_LIST)
+data_retrieval_agent = DataRetrievalAgent(semantic_layer, reference_date=datetime(2025, 7, 4))
+
+# 4. Build workflow
+graph = StateGraph(PipelineState)
+graph.add_node("module1", module1_node)
+graph.add_node("module2", module2_node)
+graph.add_edge(START, "module1")
+graph.add_edge("module1", "module2")
+graph.add_edge("module2", END)
+app = graph.compile()
+
+# 5. Test different queries
+test_queries = [
+    "What is the efficiency for VID 12345 in May 2025?",
+    "Show me data for season 2025",
+    "Get efficiency for all vehicles in 2025",
+    "What are the recommendations for vehicle 12345?"
+]
+
+for query in test_queries:
+    print(f"\n{'='*60}")
+    print(f"TESTING QUERY: {query}")
+    print('='*60)
+    
+    initial_state = {
+        "user_query": query,
+        "extracted_context": {},
+        "similar_contexts": [],
+        "filtered_df": None,
+        "sql_query": ""
+    }
+    
+    try:
+        final_state = app.invoke(initial_state)
+        print(f"\n✓ Pipeline completed successfully for: {query}")
+        
+        if final_state["filtered_df"] is not None and len(final_state["filtered_df"]) > 0:
+            print(f"Found {len(final_state['filtered_df'])} matching records")
+            
+            # Calculate efficiency if possible
+            if 'TKM' in final_state["filtered_df"].columns and 'Total_KM' in final_state["filtered_df"].columns:
+                efficiency = final_state["filtered_df"]['TKM'].sum() / final_state["filtered_df"]['Total_KM'].sum()
+                print(f"Calculated efficiency: {efficiency:.3f}")
+        else:
+            print("No matching records found")
+            
+    except Exception as e:
+        print(f"✗ Pipeline failed: {e}")
+        import traceback
+        traceback.print_exc()
