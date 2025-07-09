@@ -1,0 +1,1766 @@
+# 1. Install Required Packages
+!pip install langgraph langchain-google-genai faiss-cpu sentence-transformers gspread google-auth google-auth-oauthlib google-auth-httplib2 google-cloud-bigquery dateparser pydantic pyyaml plotly kaleido scikit-learn
+
+# 2. Imports and Configuration
+import os
+import sys
+import json
+import yaml
+import pandas as pd
+import numpy as np
+from datetime import datetime, timedelta
+from typing import Dict, List, Any, Optional, Tuple, Union, Literal
+from dataclasses import dataclass
+from enum import Enum
+import warnings
+from loguru import logger
+from pydantic import BaseModel, Field, validator, create_model
+import hashlib
+
+from langgraph.graph import Graph, END
+from langgraph.graph.message import MessageGraph
+from langchain_core.messages import BaseMessage, HumanMessage, AIMessage
+from langchain_google_genai import ChatGoogleGenerativeAI
+from sentence_transformers import SentenceTransformer
+import dateparser
+import gspread
+from google.auth import default
+from google.cloud import bigquery
+from google.api_core.exceptions import GoogleAPIError
+import faiss
+import plotly.express as px
+from sklearn.cluster import KMeans
+from sklearn.preprocessing import StandardScaler
+from statsmodels.tsa.seasonal import seasonal_decompose
+
+# Suppress warnings
+warnings.filterwarnings('ignore')
+
+# Configure logger
+logger.remove()
+logger.add(
+    sink=sys.stdout,
+    format="<green>{time:YYYY-MM-DD HH:mm:ss}</green> | <level>{level: <8}</level> | <cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - <level>{message}</level>",
+    level="INFO"
+)
+
+# 3. Configuration with Pydantic Validation
+class DataSourceType(str, Enum):
+    GOOGLE_SHEETS = "gsheet"
+    BIGQUERY = "bigquery"
+
+class AEConfig(BaseModel):
+    GOOGLE_API_KEY: str = Field(default=os.getenv("GOOGLE_API_KEY", ""), description="Google Cloud API key")
+    GOOGLE_SHEET_ID: str = Field(default="", description="Google Sheets ID")
+    SHEET_NAME: str = Field(default="efficiency_data", description="Worksheet name")
+    BIGQUERY_PROJECT_ID: str = Field(default="", description="BigQuery project ID")
+    BIGQUERY_DATASET: str = Field(default="efficiency_dataset", description="BigQuery dataset name")
+    BIGQUERY_TABLE: str = Field(default="efficiency_table", description="BigQuery table name")
+    VECTOR_DIM: int = Field(default=384, description="Dimension for vector embeddings")
+    VECTOR_INDEX_TYPE: str = Field(default="HNSW", description="Type of vector index")
+    LLM_MODEL: str = Field(default="gemini-1.5-flash", description="LLM model name")
+    LLM_TEMPERATURE: float = Field(default=0.1, description="LLM temperature parameter")
+    DEFAULT_DATA_SOURCE: DataSourceType = Field(default=DataSourceType.GOOGLE_SHEETS, description="Default data source")
+    MAX_SIMILAR_QUERIES: int = Field(default=5, description="Max similar queries to retrieve")
+    EFFICIENCY_THRESHOLD: float = Field(default=0.7, description="Efficiency threshold for alerts")
+    SEMANTIC_LAYER_PATH: str = Field(default="semantic_layer.yaml", description="Path to semantic layer YAML")
+    MAX_DATA_POINTS: int = Field(default=10000, description="Max data points to process")
+    ANOMALY_Z_SCORE: float = Field(default=2.0, description="Z-score threshold for anomalies")
+    
+    @validator('GOOGLE_API_KEY')
+    def validate_api_key(cls, v):
+        if not v:
+            raise ValueError("GOOGLE_API_KEY must be provided")
+        return v
+    
+    @validator('VECTOR_DIM')
+    def validate_vector_dim(cls, v):
+        if v not in [128, 256, 384, 512]:
+            raise ValueError("Vector dimension must be one of [128, 256, 384, 512]")
+        return v
+
+# 4. Semantic Layer Loader
+class SemanticLayerLoader:
+    @staticmethod
+    def load(file_path: str) -> Dict:
+        try:
+            with open(file_path, "r") as f:
+                config = yaml.safe_load(f)
+            
+            # Validate required sections
+            if "tables" not in config or "metrics" not in config:
+                raise ValueError("Semantic layer must contain 'tables' and 'metrics' sections")
+            
+            return config
+            
+        except Exception as e:
+            logger.error(f"Error loading semantic layer: {e}")
+            raise
+
+# 5. Time Expression Handler
+class TimeExpressionHandler:
+    def __init__(self, reference_date: Optional[datetime] = None):
+        self.reference_date = reference_date or datetime.now()
+        
+    def parse_time_expression(self, expression: str) -> Dict[str, str]:
+        expression = expression.lower().strip()
+        
+        # Handle relative time expressions
+        if expression == "now":
+            date_str = self.reference_date.strftime("%Y-%m-%d")
+            return {"expression": "now", "start": date_str, "end": date_str}
+        
+        if expression == "today":
+            date_str = self.reference_date.strftime("%Y-%m-%d")
+            return {"expression": "today", "start": date_str, "end": date_str}
+            
+        if expression == "yesterday":
+            date_str = (self.reference_date - timedelta(days=1)).strftime("%Y-%m-%d")
+            return {"expression": "yesterday", "start": date_str, "end": date_str}
+        
+        # Handle dynamic time ranges
+        if expression.startswith("last ") and " " in expression:
+            parts = expression.split()
+            try:
+                num = int(parts[1])
+                unit = parts[2] if len(parts) > 2 else "days"
+                
+                if unit in ["days", "day"]:
+                    end_date = self.reference_date
+                    start_date = end_date - timedelta(days=num)
+                elif unit in ["weeks", "week"]:
+                    end_date = self.reference_date
+                    start_date = end_date - timedelta(weeks=num)
+                elif unit in ["months", "month"]:
+                    end_date = self.reference_date
+                    start_date = end_date - timedelta(days=30*num)
+                elif unit in ["years", "year"]:
+                    end_date = self.reference_date
+                    start_date = end_date - timedelta(days=365*num)
+                else:
+                    raise ValueError(f"Unknown time unit: {unit}")
+                    
+                return {
+                    "expression": expression,
+                    "start": start_date.strftime("%Y-%m-%d"),
+                    "end": end_date.strftime("%Y-%m-%d")
+                }
+            except (ValueError, IndexError):
+                pass
+        
+        # Handle fixed time expressions
+        time_mappings = {
+            "this week": self._get_week_range(0),
+            "last week": self._get_week_range(-1),
+            "this month": self._get_month_range(0),
+            "last month": self._get_month_range(-1),
+            "this year": self._get_year_range(0),
+            "last year": self._get_year_range(-1),
+            "this quarter": self._get_quarter_range(0),
+            "last quarter": self._get_quarter_range(-1),
+        }
+        
+        if expression in time_mappings:
+            return time_mappings[expression]
+        
+        # Try dateparser for other expressions
+        try:
+            parsed_date = dateparser.parse(expression, settings={'RELATIVE_BASE': self.reference_date})
+            if parsed_date:
+                date_str = parsed_date.strftime("%Y-%m-%d")
+                return {"expression": expression, "start": date_str, "end": date_str}
+        except Exception:
+            pass
+        
+        # Default to current date if parsing fails
+        date_str = self.reference_date.strftime("%Y-%m-%d")
+        return {"expression": "default", "start": date_str, "end": date_str}
+    
+    def _get_week_range(self, weeks_offset: int) -> Dict[str, str]:
+        target_date = self.reference_date + timedelta(weeks=weeks_offset)
+        start_date = target_date - timedelta(days=target_date.weekday())
+        end_date = start_date + timedelta(days=6)
+        return {
+            "expression": f"{'this' if weeks_offset == 0 else 'last'} week",
+            "start": start_date.strftime("%Y-%m-%d"),
+            "end": end_date.strftime("%Y-%m-%d")
+        }
+    
+    def _get_month_range(self, months_offset: int) -> Dict[str, str]:
+        year = self.reference_date.year
+        month = self.reference_date.month + months_offset
+        
+        # Handle year wrap-around
+        if month < 1:
+            month += 12
+            year -= 1
+        elif month > 12:
+            month -= 12
+            year += 1
+            
+        start_date = datetime(year, month, 1)
+        if month == 12:
+            end_date = datetime(year, month, 31)
+        else:
+            end_date = datetime(year, month + 1, 1) - timedelta(days=1)
+            
+        return {
+            "expression": f"{'this' if months_offset == 0 else 'last'} month",
+            "start": start_date.strftime("%Y-%m-%d"),
+            "end": end_date.strftime("%Y-%m-%d")
+        }
+    
+    def _get_quarter_range(self, quarters_offset: int) -> Dict[str, str]:
+        year = self.reference_date.year
+        quarter = (self.reference_date.month - 1) // 3 + 1 + quarters_offset
+        
+        # Handle year wrap-around
+        if quarter < 1:
+            quarter += 4
+            year -= 1
+        elif quarter > 4:
+            quarter -= 4
+            year += 1
+            
+        start_month = (quarter - 1) * 3 + 1
+        end_month = start_month + 2
+        
+        start_date = datetime(year, start_month, 1)
+        if end_month == 12:
+            end_date = datetime(year, end_month, 31)
+        else:
+            end_date = datetime(year, end_month + 1, 1) - timedelta(days=1)
+            
+        return {
+            "expression": f"{'this' if quarters_offset == 0 else 'last'} quarter",
+            "start": start_date.strftime("%Y-%m-%d"),
+            "end": end_date.strftime("%Y-%m-%d")
+        }
+    
+    def _get_year_range(self, years_offset: int) -> Dict[str, str]:
+        year = self.reference_date.year + years_offset
+        start_date = datetime(year, 1, 1)
+        end_date = datetime(year, 12, 31)
+        return {
+            "expression": f"{'this' if years_offset == 0 else 'last'} year",
+            "start": start_date.strftime("%Y-%m-%d"),
+            "end": end_date.strftime("%Y-%m-%d")
+        }
+
+# 6. Vector Search Engine with Persistence
+class VectorSearchEngine:
+    def __init__(self, dimension: int = 384, index_type: str = "HNSW"):
+        self.dimension = dimension
+        self.encoder = SentenceTransformer('all-MiniLM-L6-v2')
+        self.index_type = index_type
+        self._initialize_index()
+        self.query_history = []
+        self.next_id = 1
+        
+    def _initialize_index(self):
+        if self.index_type == "HNSW":
+            self.index = faiss.IndexHNSWFlat(self.dimension, 32)
+        elif self.index_type == "IVF":
+            quantizer = faiss.IndexFlatL2(self.dimension)
+            self.index = faiss.IndexIVFFlat(quantizer, self.dimension, 100)
+            self.index.train(np.random.rand(100, self.dimension).astype('float32'))
+        else:
+            self.index = faiss.IndexFlatL2(self.dimension)
+    
+    def add_query(self, query: str, intents: List[str], metadata: Optional[Dict] = None) -> int:
+        embedding = self.encoder.encode([query])[0]
+        
+        # Ensure the index is trained for IVF
+        if self.index_type == "IVF" and not self.index.is_trained:
+            self.index.train(np.random.rand(100, self.dimension).astype('float32'))
+        
+        self.index.add(np.array([embedding], dtype=np.float32))
+        
+        query_id = self.next_id
+        self.query_history.append({
+            "id": query_id,
+            "query": query,
+            "intents": intents,
+            "embedding": embedding.tolist(),
+            "metadata": metadata or {},
+            "timestamp": datetime.now().isoformat()
+        })
+        self.next_id += 1
+        return query_id
+    
+    def search_similar(self, query: str, top_k: int = 3, intent_filter: Optional[List[str]] = None) -> List[Dict]:
+        if not self.query_history:
+            return []
+            
+        query_embedding = self.encoder.encode([query])[0]
+        query_embedding = np.array([query_embedding], dtype=np.float32)
+        
+        # Search the index
+        distances, indices = self.index.search(query_embedding, min(top_k, len(self.query_history)))
+        
+        similar_contexts = []
+        for i, idx in enumerate(indices[0]):
+            if idx < 0 or idx >= len(self.query_history):
+                continue
+                
+            context = self.query_history[idx]
+            
+            # Apply intent filter if provided
+            if intent_filter and not any(intent in context["intents"] for intent in intent_filter):
+                continue
+                
+            similar_contexts.append({
+                "id": context["id"],
+                "query": context["query"],
+                "intents": context["intents"],
+                "similarity": float(1 - distances[0][i]),
+                "metadata": context["metadata"],
+                "timestamp": context["timestamp"]
+            })
+        
+        # Sort by similarity (descending)
+        similar_contexts.sort(key=lambda x: x["similarity"], reverse=True)
+        return similar_contexts[:top_k]
+    
+    def save_to_file(self, file_path: str):
+        state = {
+            "dimension": self.dimension,
+            "index_type": self.index_type,
+            "query_history": self.query_history,
+            "next_id": self.next_id,
+            "index": faiss.serialize_index(self.index).tolist() if self.index else None
+        }
+        with open(file_path, "w") as f:
+            json.dump(state, f)
+    
+    @classmethod
+    def load_from_file(cls, file_path: str) -> "VectorSearchEngine":
+        with open(file_path, "r") as f:
+            state = json.load(f)
+        
+        engine = cls(state["dimension"], state["index_type"])
+        engine.query_history = state["query_history"]
+        engine.next_id = state["next_id"]
+        
+        if state["index"] is not None:
+            engine.index = faiss.deserialize_index(np.array(state["index"], dtype=np.uint8))
+        
+        return engine
+
+# 7. Query Understanding Agent with Multi-Intent Support
+class QueryUnderstandingAgent:
+    INTENT_PROMPT_TEMPLATE = """
+    Analyze this query and identify all relevant intents from the following list:
+    
+    Available Intents:
+    1. fetch_metric - Retrieve a metric value (e.g., "What is the efficiency for JP?")
+    2. compare_metric - Compare metrics across entities/time (e.g., "Compare efficiency between regions")
+    3. rank_entities - Rank entities by metric (e.g., "Top 5 vehicles by efficiency")
+    4. diagnose_metric - Explain reasons for metric values (e.g., "Why is efficiency low?")
+    5. trend_analysis - Analyze trends over time (e.g., "Show efficiency trend last year")
+    6. threshold_check - Check threshold compliance (e.g., "Is efficiency below 70%?")
+    7. list_entities_by_criteria - List entities meeting criteria (e.g., "Which vehicles have efficiency < 60%?")
+    8. summarize_metric - Provide metric summary (e.g., "Summarize efficiency for all vehicles")
+    9. cohort_analysis - Analyze by groups/cohorts (e.g., "Show efficiency by vehicle type")
+    10. hierarchical_analysis - Drill-down analysis (e.g., "Analyze by region then depot")
+    11. forecast_metric - Forecast future values (e.g., "Forecast efficiency for next quarter")
+    12. cluster_analysis - Cluster entities by patterns (e.g., "Cluster vehicles by efficiency patterns")
+    13. get_recommendation - Suggest improvements (e.g., "How can we improve efficiency?")
+    14. generate_code - Provide analysis code (e.g., "Show me the analysis code")
+    15. generate_chart - Create visualizations (e.g., "Show a line chart of trends")
+    16. download_report - Export results (e.g., "Download this report as CSV")
+    
+    Query: "{query}"
+    
+    Return a JSON list of intent names that apply to this query, ordered by relevance.
+    Example: ["trend_analysis", "compare_metric"]
+    """
+    
+    ENTITY_PROMPT_TEMPLATE = """
+    Extract entities from this query related to efficiency analysis:
+    
+    Available entities:
+    - vehicle_id (VID, vehicle ID)
+    - country_code (country)
+    - region
+    - user_email (driver email)
+    - metric (efficiency, target_km, total_km, etc.)
+    - timeframe (time period)
+    - cohort (grouping dimension)
+    - hierarchy_levels (drill-down dimensions)
+    
+    Query: "{query}"
+    
+    Return as JSON with entity types as keys and extracted values as values.
+    If no specific entity is mentioned, use "all" as the value.
+    
+    Example: {{
+        "metric": "efficiency", 
+        "vehicle_id": "12345", 
+        "country_code": "JP",
+        "cohort": "vehicle_type",
+        "hierarchy_levels": ["region", "depot"]
+    }}
+    """
+    
+    TIMEFRAME_PROMPT_TEMPLATE = """
+    Extract time expression from this query:
+    
+    Query: "{query}"
+    
+    Look for time expressions like:
+    - this week, last week, this month, last month
+    - this year, last year, this quarter, last quarter
+    - last N days/weeks/months/years
+    - specific dates or periods
+    
+    Return only the time expression found, or "not specified" if none.
+    """
+    
+    def __init__(self, config: AEConfig):
+        self.config = config
+        self.llm = ChatGoogleGenerativeAI(
+            model=config.LLM_MODEL,
+            temperature=config.LLM_TEMPERATURE,
+            google_api_key=config.GOOGLE_API_KEY
+        )
+        self.semantic_layer = SemanticLayerLoader.load(config.SEMANTIC_LAYER_PATH)
+        self.time_handler = TimeExpressionHandler()
+        self.vector_search = VectorSearchEngine(config.VECTOR_DIM, config.VECTOR_INDEX_TYPE)
+        
+    def extract_intents(self, query: str) -> List[str]:
+        try:
+            prompt = self.INTENT_PROMPT_TEMPLATE.format(query=query)
+            response = self.llm.invoke(prompt)
+            
+            try:
+                intents = json.loads(response.content.strip())
+                if not isinstance(intents, list):
+                    raise ValueError("Response is not a list")
+                
+                # Validate intents against known set
+                valid_intents = {
+                    "fetch_metric", "compare_metric", "rank_entities", 
+                    "diagnose_metric", "trend_analysis", "threshold_check",
+                    "list_entities_by_criteria", "summarize_metric", 
+                    "cohort_analysis", "hierarchical_analysis", "forecast_metric",
+                    "cluster_analysis", "get_recommendation", "generate_code",
+                    "generate_chart", "download_report"
+                }
+                
+                return [intent for intent in intents if intent in valid_intents]
+                
+            except (json.JSONDecodeError, ValueError) as e:
+                logger.warning(f"Failed to parse intents JSON: {e}")
+                return ["fetch_metric"]  # Default intent
+                
+        except Exception as e:
+            logger.error(f"Error extracting intents: {e}")
+            return ["fetch_metric"]  # Fallback intent
+    
+    def extract_entities(self, query: str) -> Dict[str, Any]:
+        try:
+            prompt = self.ENTITY_PROMPT_TEMPLATE.format(query=query)
+            response = self.llm.invoke(prompt)
+            
+            try:
+                entities = json.loads(response.content.strip())
+                if not isinstance(entities, dict):
+                    raise ValueError("Response is not a dictionary")
+            except (json.JSONDecodeError, ValueError) as e:
+                logger.warning(f"Failed to parse entities JSON: {e}")
+                entities = {"metric": "efficiency"}
+            
+            # Map entities to schema
+            mapped_entities = {}
+            for entity_type, value in entities.items():
+                if entity_type == "hierarchy_levels":
+                    # Validate hierarchy levels against schema
+                    valid_levels = []
+                    for level in value:
+                        mapped_level = self.semantic_layer.get_column_mapping(level)
+                        if mapped_level:
+                            valid_levels.append(mapped_level)
+                    mapped_entities["hierarchy_levels"] = valid_levels
+                else:
+                    mapped_column = self.semantic_layer.get_column_mapping(entity_type)
+                    if mapped_column:
+                        mapped_entities[mapped_column] = value
+                    else:
+                        mapped_entities[entity_type] = value
+            
+            return mapped_entities
+            
+        except Exception as e:
+            logger.error(f"Error extracting entities: {e}")
+            return {"metric": "efficiency"}  # Fallback entities
+    
+    def extract_timeframe(self, query: str) -> Dict[str, str]:
+        try:
+            prompt = self.TIMEFRAME_PROMPT_TEMPLATE.format(query=query)
+            response = self.llm.invoke(prompt)
+            time_expression = response.content.strip().lower()
+            
+            if time_expression == "not specified":
+                return {"expression": "not specified", "start": None, "end": None}
+                
+            parsed_time = self.time_handler.parse_time_expression(time_expression)
+            return {
+                "expression": time_expression,
+                "start": parsed_time["start"],
+                "end": parsed_time["end"]
+            }
+            
+        except Exception as e:
+            logger.error(f"Error extracting timeframe: {e}")
+            return {"expression": "default", "start": None, "end": None}
+    
+    def process_query(self, query: str) -> Dict[str, Any]:
+        logger.info(f"Processing query: {query}")
+        
+        intents = self.extract_intents(query)
+        logger.info(f"Extracted intents: {intents}")
+        
+        entities = self.extract_entities(query)
+        logger.info(f"Extracted entities: {entities}")
+        
+        timeframe = self.extract_timeframe(query)
+        logger.info(f"Extracted timeframe: {timeframe}")
+        
+        similar_contexts = self.vector_search.search_similar(
+            query, 
+            top_k=self.config.MAX_SIMILAR_QUERIES,
+            intent_filter=intents
+        )
+        logger.info(f"Found {len(similar_contexts)} similar contexts")
+        
+        # Add current query to history
+        query_id = self.vector_search.add_query(query, intents)
+        
+        result = {
+            "intents": intents,
+            "user_query": query,
+            "query_id": query_id,
+            "extracted_context": {
+                "entities": entities,
+                "timeframe": timeframe
+            },
+            "similar_contexts": similar_contexts
+        }
+        
+        logger.debug(f"Query understanding result: {json.dumps(result, indent=2)}")
+        return result
+
+# 8. Data Retrieval Agent
+class DataRetrievalAgent:
+    def __init__(self, config: AEConfig):
+        self.config = config
+        self.semantic_layer = SemanticLayerLoader.load(config.SEMANTIC_LAYER_PATH)
+        self.llm = ChatGoogleGenerativeAI(
+            model=config.LLM_MODEL,
+            temperature=config.LLM_TEMPERATURE,
+            google_api_key=config.GOOGLE_API_KEY
+        )
+        self.sheets_client = None
+        self.bq_client = None
+        self._initialize_connections()
+    
+    def _initialize_connections(self):
+        # Initialize Google Sheets connection
+        try:
+            creds, _ = default()
+            self.sheets_client = gspread.authorize(creds)
+            logger.success("Google Sheets connection initialized")
+        except Exception as e:
+            logger.error(f"Google Sheets connection failed: {e}")
+            self.sheets_client = None
+        
+        # Initialize BigQuery connection
+        try:
+            self.bq_client = bigquery.Client(project=self.config.BIGQUERY_PROJECT_ID)
+            logger.success("BigQuery connection initialized")
+        except Exception as e:
+            logger.error(f"BigQuery connection failed: {e}")
+            self.bq_client = None
+    
+    def retrieve_data(self, context: Dict[str, Any], data_source: Optional[DataSourceType] = None) -> pd.DataFrame:
+        data_source = data_source or self.config.DEFAULT_DATA_SOURCE
+        
+        if data_source == DataSourceType.GOOGLE_SHEETS:
+            return self.retrieve_from_sheets(context)
+        elif data_source == DataSourceType.BIGQUERY:
+            return self.retrieve_from_bigquery(context)
+        else:
+            raise ValueError(f"Unsupported data source: {data_source}")
+    
+    def retrieve_from_sheets(self, context: Dict[str, Any]) -> pd.DataFrame:
+        if not self.sheets_client:
+            raise RuntimeError("Google Sheets client not initialized")
+        
+        try:
+            sheet = self.sheets_client.open_by_key(self.config.GOOGLE_SHEET_ID)
+            worksheet = sheet.worksheet(self.config.SHEET_NAME)
+            
+            # Get all records
+            records = worksheet.get_all_records()
+            df = pd.DataFrame.from_records(records)
+            
+            if df.empty:
+                raise ValueError("No data found in Google Sheets")
+            
+            # Apply basic data validation
+            required_columns = {"TKM", "Total_KM"}
+            missing_columns = required_columns - set(df.columns)
+            if missing_columns:
+                raise ValueError(f"Missing required columns in data: {missing_columns}")
+            
+            # Calculate efficiency
+            df['efficiency'] = df['TKM'] / df['Total_KM']
+            
+            # Apply filters based on context
+            entities = context.get("extracted_context", {}).get("entities", {})
+            timeframe = context.get("extracted_context", {}).get("timeframe", {})
+            
+            # Filter by entities
+            for entity_type, value in entities.items():
+                if entity_type in df.columns and value != "all":
+                    df = df[df[entity_type] == value]
+            
+            # Filter by timeframe
+            if timeframe.get("start") and timeframe.get("end") and "drive_date" in df.columns:
+                mask = (df['drive_date'] >= timeframe["start"]) & (df['drive_date'] <= timeframe["end"])
+                df = df[mask]
+            
+            # Limit data size
+            if len(df) > self.config.MAX_DATA_POINTS:
+                df = df.sample(self.config.MAX_DATA_POINTS)
+                logger.warning(f"Data truncated to {self.config.MAX_DATA_POINTS} records")
+            
+            return df
+            
+        except Exception as e:
+            logger.error(f"Error retrieving from Google Sheets: {e}")
+            raise
+    
+    def retrieve_from_bigquery(self, context: Dict[str, Any]) -> pd.DataFrame:
+        if not self.bq_client:
+            raise RuntimeError("BigQuery client not initialized")
+        
+        try:
+            sql_query = self.generate_sql_query(context)
+            logger.debug(f"Executing BigQuery SQL: {sql_query}")
+            
+            query_job = self.bq_client.query(sql_query)
+            df = query_job.to_dataframe()
+            
+            if df.empty:
+                raise ValueError("No data returned from BigQuery")
+            
+            # Calculate efficiency if not already in results
+            if 'efficiency' not in df.columns and 'TKM' in df.columns and 'Total_KM' in df.columns:
+                df['efficiency'] = df['TKM'] / df['Total_KM']
+            
+            # Limit data size
+            if len(df) > self.config.MAX_DATA_POINTS:
+                df = df.sample(self.config.MAX_DATA_POINTS)
+                logger.warning(f"Data truncated to {self.config.MAX_DATA_POINTS} records")
+            
+            return df
+            
+        except Exception as e:
+            logger.error(f"Error retrieving from BigQuery: {e}")
+            raise
+    
+    def generate_sql_query(self, context: Dict[str, Any]) -> str:
+        intents = context.get("intents", ["fetch_metric"])
+        entities = context.get("extracted_context", {}).get("entities", {})
+        timeframe = context.get("extracted_context", {}).get("timeframe", {})
+        
+        base_table = f"`{self.config.BIGQUERY_PROJECT_ID}.{self.config.BIGQUERY_DATASET}.{self.config.BIGQUERY_TABLE}`"
+        
+        # Build SELECT clause based on intents
+        select_clause = self._build_select_clause(intents, entities)
+        
+        # Build WHERE conditions
+        where_conditions = []
+        
+        # Timeframe filter
+        if timeframe.get("start") and timeframe.get("end"):
+            where_conditions.append(
+                f"drive_date BETWEEN '{timeframe['start']}' AND '{timeframe['end']}'"
+            )
+        
+        # Entity filters
+        for entity_type, value in entities.items():
+            if value != "all" and entity_type in ["vehicle_id", "country_code", "region", "user_email"]:
+                where_conditions.append(f"{entity_type} = '{value}'")
+        
+        # Build GROUP BY clause
+        group_by_clause = self._build_group_by_clause(intents, entities)
+        
+        # Build ORDER BY clause
+        order_by_clause = self._build_order_by_clause(intents)
+        
+        # Build LIMIT clause
+        limit_clause = f"LIMIT {self.config.MAX_DATA_POINTS}"
+        
+        # Build the full query
+        query_parts = [f"SELECT {select_clause}", f"FROM {base_table}"]
+        
+        if where_conditions:
+            query_parts.append(f"WHERE {' AND '.join(where_conditions)}")
+        
+        if group_by_clause:
+            query_parts.append(f"GROUP BY {group_by_clause}")
+        
+        if order_by_clause:
+            query_parts.append(f"ORDER BY {order_by_clause}")
+        
+        query_parts.append(limit_clause)
+        
+        return " ".join(query_parts)
+    
+    def _build_select_clause(self, intents: List[str], entities: Dict[str, Any]) -> str:
+        metric_info = self.semantic_layer.get("metrics", {}).get("efficiency", {})
+        efficiency_formula = metric_info.get("formula", "SUM(TKM)/NULLIF(SUM(Total_KM),0)")
+        
+        select_fields = []
+        
+        # Always include efficiency
+        select_fields.append(f"{efficiency_formula} AS efficiency")
+        
+        # Add fields based on intents
+        if "trend_analysis" in intents or "forecast_metric" in intents:
+            select_fields.append("drive_month")
+        
+        if "cohort_analysis" in intents and "cohort" in entities:
+            select_fields.append(entities["cohort"])
+        
+        if "hierarchical_analysis" in intents and "hierarchy_levels" in entities:
+            select_fields.extend(entities["hierarchy_levels"])
+        
+        if "compare_metric" in intents:
+            select_fields.extend(["vehicle_id", "drive_month"])
+        
+        if "rank_entities" in intents:
+            select_fields.append("vehicle_id")
+        
+        if "diagnose_metric" in intents:
+            select_fields.extend(["vehicle_id", "region", "country_code"])
+        
+        # Add any explicitly requested entities
+        for entity in ["vehicle_id", "region", "country_code"]:
+            if entity in entities and entities[entity] != "all":
+                select_fields.append(entity)
+        
+        return ", ".join(set(select_fields))  # Remove duplicates
+    
+    def _build_group_by_clause(self, intents: List[str], entities: Dict[str, Any]) -> str:
+        group_fields = []
+        
+        if "trend_analysis" in intents or "forecast_metric" in intents:
+            group_fields.append("drive_month")
+        
+        if "cohort_analysis" in intents and "cohort" in entities:
+            group_fields.append(entities["cohort"])
+        
+        if "hierarchical_analysis" in intents and "hierarchy_levels" in entities:
+            group_fields.extend(entities["hierarchy_levels"])
+        
+        if "compare_metric" in intents:
+            group_fields.extend(["vehicle_id", "drive_month"])
+        
+        if "rank_entities" in intents:
+            group_fields.append("vehicle_id")
+        
+        return ", ".join(set(group_fields)) if group_fields else ""
+    
+    def _build_order_by_clause(self, intents: List[str]) -> str:
+        if "trend_analysis" in intents or "forecast_metric" in intents:
+            return "drive_month"
+        elif "rank_entities" in intents:
+            return "efficiency DESC"
+        elif "threshold_check" in intents:
+            return "efficiency ASC"
+        return ""
+
+# 9. Enhanced AnalysisAgent with Advanced Capabilities
+class AnalysisAgent:
+    def __init__(self, config: AEConfig):
+        self.config = config
+        self.semantic_layer = SemanticLayerLoader.load(config.SEMANTIC_LAYER_PATH)
+        self.llm = ChatGoogleGenerativeAI(
+            model=config.LLM_MODEL,
+            temperature=config.LLM_TEMPERATURE,
+            google_api_key=config.GOOGLE_API_KEY
+        )
+    
+    def analyze(self, data: pd.DataFrame, intents: List[str], context: Dict[str, Any]) -> Dict[str, Any]:
+        if data.empty:
+            return {"error": "No data available for analysis"}
+        
+        analysis_results = {}
+        
+        # Always calculate basic metrics
+        analysis_results.update(self._calculate_basic_metrics(data))
+        
+        # Intent-specific analysis
+        if "compare_metric" in intents:
+            analysis_results.update(self._perform_comparison_analysis(data, context))
+        
+        if "rank_entities" in intents:
+            analysis_results.update(self._perform_ranking_analysis(data, context))
+        
+        if "trend_analysis" in intents:
+            analysis_results.update(self._perform_trend_analysis(data, context))
+        
+        if "threshold_check" in intents:
+            analysis_results.update(self._perform_threshold_check(data))
+        
+        if "cohort_analysis" in intents:
+            analysis_results.update(self._perform_cohort_analysis(data, context))
+        
+        if "hierarchical_analysis" in intents:
+            analysis_results.update(self._perform_hierarchical_analysis(data, context))
+        
+        if "forecast_metric" in intents:
+            analysis_results.update(self._perform_forecasting(data, context))
+        
+        if "cluster_analysis" in intents:
+            analysis_results.update(self._perform_clustering(data, context))
+        
+        if "diagnose_metric" in intents:
+            analysis_results.update(self._perform_diagnosis(data, context))
+        
+        if "get_recommendation" in intents:
+            analysis_results.update(self._generate_recommendations(data, context))
+        
+        return analysis_results
+    
+    def _calculate_basic_metrics(self, data: pd.DataFrame) -> Dict[str, Any]:
+        metrics = {
+            "total_records": len(data),
+        }
+        
+        if 'efficiency' in data.columns:
+            metrics.update({
+                "avg_efficiency": float(data['efficiency'].mean()),
+                "min_efficiency": float(data['efficiency'].min()),
+                "max_efficiency": float(data['efficiency'].max()),
+                "std_efficiency": float(data['efficiency'].std()),
+                "median_efficiency": float(data['efficiency'].median()),
+            })
+            
+            # Threshold analysis
+            below_threshold = data[data['efficiency'] < self.config.EFFICIENCY_THRESHOLD]
+            metrics.update({
+                "below_threshold": int(len(below_threshold)),
+                "above_threshold": int(len(data) - len(below_threshold)),
+                "threshold_compliance_rate": float((len(data) - len(below_threshold)) / len(data) * 100)
+            })
+        
+        return metrics
+    
+    def _perform_comparison_analysis(self, data: pd.DataFrame, context: Dict[str, Any]) -> Dict[str, Any]:
+        comparisons = {}
+        
+        if 'vehicle_id' in data.columns and data['vehicle_id'].nunique() > 1:
+            vehicle_comparison = data.groupby('vehicle_id')['efficiency'].mean().sort_values(ascending=False)
+            comparisons['by_vehicle'] = vehicle_comparison.to_dict()
+        
+        if 'region' in data.columns and data['region'].nunique() > 1:
+            region_comparison = data.groupby('region')['efficiency'].mean().sort_values(ascending=False)
+            comparisons['by_region'] = region_comparison.to_dict()
+        
+        if 'drive_month' in data.columns and data['drive_month'].nunique() > 1:
+            time_comparison = data.groupby('drive_month')['efficiency'].mean().sort_values()
+            comparisons['by_time'] = time_comparison.to_dict()
+        
+        return {"comparisons": comparisons}
+    
+    def _perform_ranking_analysis(self, data: pd.DataFrame, context: Dict[str, Any]) -> Dict[str, Any]:
+        rankings = {}
+        top_n = 5  # Default, could be configurable
+        
+        if 'vehicle_id' in data.columns:
+            vehicle_ranking = data.groupby('vehicle_id')['efficiency'].mean().sort_values(ascending=False)
+            rankings['top_vehicles'] = vehicle_ranking.head(top_n).to_dict()
+            rankings['bottom_vehicles'] = vehicle_ranking.tail(top_n).to_dict()
+        
+        if 'region' in data.columns:
+            region_ranking = data.groupby('region')['efficiency'].mean().sort_values(ascending=False)
+            rankings['top_regions'] = region_ranking.head(top_n).to_dict()
+            rankings['bottom_regions'] = region_ranking.tail(top_n).to_dict()
+        
+        return {"rankings": rankings}
+    
+    def _perform_trend_analysis(self, data: pd.DataFrame, context: Dict[str, Any]) -> Dict[str, Any]:
+        trends = {}
+        
+        if 'drive_month' in data.columns and data['drive_month'].nunique() > 1:
+            try:
+                # Convert to datetime and sort
+                data['drive_month'] = pd.to_datetime(data['drive_month'])
+                data = data.sort_values('drive_month')
+                
+                # Resample to monthly if needed
+                monthly_data = data.set_index('drive_month').resample('M')['efficiency'].mean().reset_index()
+                
+                # Decompose time series
+                decomposition = seasonal_decompose(
+                    monthly_data.set_index('drive_month')['efficiency'],
+                    model='additive',
+                    period=12  # Annual seasonality
+                )
+                
+                trends['monthly_trend'] = monthly_data.to_dict('list')
+                trends['seasonal_component'] = decomposition.seasonal.reset_index().to_dict('list')
+                trends['trend_component'] = decomposition.trend.reset_index().to_dict('list')
+                trends['residuals'] = decomposition.resid.reset_index().to_dict('list')
+                
+            except Exception as e:
+                logger.error(f"Error in trend analysis: {e}")
+                monthly_trend = data.groupby('drive_month')['efficiency'].mean().sort_index()
+                trends['monthly_trend'] = monthly_trend.to_dict()
+        
+        return {"trends": trends}
+    
+    def _perform_threshold_check(self, data: pd.DataFrame) -> Dict[str, Any]:
+        threshold_results = {}
+        
+        if 'efficiency' in data.columns:
+            below_threshold = data[data['efficiency'] < self.config.EFFICIENCY_THRESHOLD]
+            threshold_results['below_threshold_entities'] = below_threshold.to_dict('records')
+        
+        return {"threshold_results": threshold_results}
+    
+    def _perform_cohort_analysis(self, data: pd.DataFrame, context: Dict[str, Any]) -> Dict[str, Any]:
+        cohort_results = {}
+        entities = context.get("extracted_context", {}).get("entities", {})
+        
+        if 'cohort' in entities and entities['cohort'] in data.columns:
+            cohort = entities['cohort']
+            cohort_analysis = data.groupby(cohort)['efficiency'].agg(['mean', 'count', 'std'])
+            cohort_results['cohort_analysis'] = cohort_analysis.to_dict('index')
+        
+        return {"cohort_analysis": cohort_results}
+    
+    def _perform_hierarchical_analysis(self, data: pd.DataFrame, context: Dict[str, Any]) -> Dict[str, Any]:
+        hierarchical_results = {}
+        entities = context.get("extracted_context", {}).get("entities", {})
+        
+        if 'hierarchy_levels' in entities:
+            levels = entities['hierarchy_levels']
+            valid_levels = [level for level in levels if level in data.columns]
+            
+            if valid_levels:
+                drill_down = {}
+                current_data = data.copy()
+                
+                for level in valid_levels:
+                    if level in current_data.columns:
+                        level_analysis = current_data.groupby(level)['efficiency'].mean().sort_values(ascending=False)
+                        drill_down[level] = level_analysis.to_dict()
+                        current_data = current_data[current_data[level] == level_analysis.idxmax()]
+                
+                hierarchical_results['hierarchical_drill_down'] = drill_down
+        
+        return {"hierarchical_analysis": hierarchical_results}
+    
+    def _perform_forecasting(self, data: pd.DataFrame, context: Dict[str, Any]) -> Dict[str, Any]:
+        forecast_results = {}
+        
+        if 'drive_month' in data.columns and data['drive_month'].nunique() > 6:  # Need enough data points
+            try:
+                # Convert to datetime and sort
+                data['drive_month'] = pd.to_datetime(data['drive_month'])
+                data = data.sort_values('drive_month')
+                
+                # Simple moving average forecast (in a real app, use proper time series models)
+                monthly_data = data.set_index('drive_month')['efficiency'].resample('M').mean()
+                forecast = monthly_data.rolling(window=3).mean().iloc[-3:]  # Last 3 months average
+                
+                forecast_results['forecast'] = {
+                    "method": "3-month moving average",
+                    "values": forecast.to_dict()
+                }
+                
+            except Exception as e:
+                logger.error(f"Error in forecasting: {e}")
+                forecast_results['forecast_error'] = str(e)
+        
+        return {"forecast": forecast_results}
+    
+    def _perform_clustering(self, data: pd.DataFrame, context: Dict[str, Any]) -> Dict[str, Any]:
+        cluster_results = {}
+        
+        if len(data) >= 5:  # Need minimum data points for clustering
+            try:
+                # Prepare features (could be extended based on context)
+                features = data[['efficiency']].copy()
+                
+                # Standardize features
+                scaler = StandardScaler()
+                scaled_features = scaler.fit_transform(features)
+                
+                # Cluster (simple k-means with k=2 for high/low efficiency)
+                kmeans = KMeans(n_clusters=2, random_state=42)
+                clusters = kmeans.fit_predict(scaled_features)
+                
+                # Add cluster labels to data
+                data['cluster'] = clusters
+                
+                # Analyze clusters
+                cluster_analysis = data.groupby('cluster')['efficiency'].agg(['mean', 'count', 'std'])
+                
+                cluster_results['clusters'] = {
+                    "method": "KMeans (k=2)",
+                    "cluster_centers": kmeans.cluster_centers_.tolist(),
+                    "cluster_analysis": cluster_analysis.to_dict('index'),
+                    "cluster_assignments": data[['vehicle_id', 'cluster']].to_dict('records')
+                }
+                
+            except Exception as e:
+                logger.error(f"Error in clustering: {e}")
+                cluster_results['cluster_error'] = str(e)
+        
+        return {"cluster_analysis": cluster_results}
+    
+    def _perform_diagnosis(self, data: pd.DataFrame, context: Dict[str, Any]) -> Dict[str, Any]:
+        diagnosis_results = {}
+        
+        try:
+            # Prepare prompt for LLM diagnosis
+            prompt = f"""
+            Analyze the following efficiency data and provide diagnostic insights:
+            
+            Context:
+            - Query: {context.get('user_query', 'Unknown')}
+            - Timeframe: {context.get('extracted_context', {}).get('timeframe', {}).get('expression', 'Unknown')}
+            - Entities: {context.get('extracted_context', {}).get('entities', {})}
+            
+            Data Summary:
+            - Average Efficiency: {data['efficiency'].mean():.2f}
+            - Minimum Efficiency: {data['efficiency'].min():.2f}
+            - Maximum Efficiency: {data['efficiency'].max():.2f}
+            - Standard Deviation: {data['efficiency'].std():.2f}
+            - Records Below Threshold ({self.config.EFFICIENCY_THRESHOLD}): {len(data[data['efficiency'] < self.config.EFFICIENCY_THRESHOLD])}
+            
+            Provide a concise diagnosis of potential causes for any efficiency issues, 
+            considering the available data columns: {', '.join(data.columns)}.
+            """
+            
+            response = self.llm.invoke(prompt)
+            diagnosis_results['diagnosis'] = response.content
+            
+        except Exception as e:
+            logger.error(f"Error in diagnosis: {e}")
+            diagnosis_results['diagnosis_error'] = str(e)
+        
+        return {"diagnosis": diagnosis_results}
+    
+    def _generate_recommendations(self, data: pd.DataFrame, context: Dict[str, Any]) -> Dict[str, Any]:
+        recommendation_results = {}
+        
+        try:
+            # Prepare prompt for LLM recommendations
+            prompt = f"""
+            Based on the following efficiency analysis, provide actionable recommendations:
+            
+            Context:
+            - Query: {context.get('user_query', 'Unknown')}
+            - Timeframe: {context.get('extracted_context', {}).get('timeframe', {}).get('expression', 'Unknown')}
+            - Entities: {context.get('extracted_context', {}).get('entities', {})}
+            
+            Data Summary:
+            - Average Efficiency: {data['efficiency'].mean():.2f}
+            - Minimum Efficiency: {data['efficiency'].min():.2f}
+            - Maximum Efficiency: {data['efficiency'].max():.2f}
+            - Records Below Threshold ({self.config.EFFICIENCY_THRESHOLD}): {len(data[data['efficiency'] < self.config.EFFICIENCY_THRESHOLD])}
+            
+            Provide 3-5 specific, actionable recommendations to improve efficiency, 
+            considering the available data columns: {', '.join(data.columns)}.
+            Format as a numbered list.
+            """
+            
+            response = self.llm.invoke(prompt)
+            recommendation_results['recommendations'] = response.content
+            
+        except Exception as e:
+            logger.error(f"Error generating recommendations: {e}")
+            recommendation_results['recommendation_error'] = str(e)
+        
+        return {"recommendations": recommendation_results}
+    
+    def generate_analysis_code(self, analysis_type: str, context: Dict[str, Any]) -> str:
+        try:
+            prompt = f"""
+            Generate Python code to perform {analysis_type} analysis on efficiency data.
+            
+            Context:
+            - Data Source: {self.config.DEFAULT_DATA_SOURCE.value}
+            - Available Columns: {', '.join(self.semantic_layer.get('tables', {}).get('efficiency_table', {}).get('columns', {}).keys())}
+            - Timeframe: {context.get('extracted_context', {}).get('timeframe', {}).get('expression', 'Not specified')}
+            - Entities: {context.get('extracted_context', {}).get('entities', {})}
+            
+            The code should:
+            1. Load the data from {self.config.DEFAULT_DATA_SOURCE.value}
+            2. Perform the {analysis_type} analysis
+            3. Return the results in a clear format
+            
+            Provide complete, executable Python code with comments explaining each step.
+            """
+            
+            response = self.llm.invoke(prompt)
+            return response.content
+            
+        except Exception as e:
+            logger.error(f"Error generating analysis code: {e}")
+            return f"Error generating code: {str(e)}"
+
+# 10. Enhanced AnomalyDetectionAgent
+class AnomalyDetectionAgent:
+    def __init__(self, config: AEConfig):
+        self.config = config
+    
+    def detect_anomalies(self, data: pd.DataFrame, context: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        results = {}
+        
+        if data.empty:
+            return {"error": "No data available for anomaly detection"}
+        
+        # Data Quality Checks
+        data_quality = self._check_data_quality(data)
+        results.update(data_quality)
+        
+        # Statistical Anomalies
+        if 'efficiency' in data.columns:
+            anomalies = self._detect_statistical_anomalies(data)
+            results.update(anomalies)
+        
+        # Data Drift Detection
+        if context and 'timeframe' in context.get('extracted_context', {}):
+            drift = self._detect_data_drift(data, context)
+            results.update(drift)
+        
+        return results
+    
+    def _check_data_quality(self, data: pd.DataFrame) -> Dict[str, Any]:
+        quality_checks = {}
+        
+        # Missing values
+        missing_values = data.isnull().sum()
+        quality_checks['missing_values'] = missing_values[missing_values > 0].to_dict()
+        
+        # Duplicates
+        duplicates = data.duplicated().sum()
+        quality_checks['duplicate_records'] = int(duplicates)
+        
+        # Data consistency
+        if 'efficiency' in data.columns:
+            invalid_efficiency = data[(data['efficiency'] < 0) | (data['efficiency'] > 2)]
+            quality_checks['invalid_efficiency'] = len(invalid_efficiency)
+        
+        return {"data_quality": quality_checks}
+    
+    def _detect_statistical_anomalies(self, data: pd.DataFrame) -> Dict[str, Any]:
+        anomalies = {}
+        
+        # Calculate z-scores
+        mean_val = data['efficiency'].mean()
+        std_val = data['efficiency'].std()
+        
+        if std_val > 0:  # Only if there's variation
+            data['z_score'] = (data['efficiency'] - mean_val) / std_val
+            data['anomaly'] = data['z_score'].abs() > self.config.ANOMALY_Z_SCORE
+            
+            anomaly_count = data['anomaly'].sum()
+            anomalies['statistical_anomalies'] = {
+                "anomaly_count": int(anomaly_count),
+                "anomaly_rate": float(anomaly_count / len(data)),
+                "anomaly_threshold": self.config.ANOMALY_Z_SCORE,
+                "anomaly_records": data[data['anomaly']].to_dict('records')
+            }
+        
+        return {"statistical_anomalies": anomalies}
+    
+    def _detect_data_drift(self, data: pd.DataFrame, context: Dict[str, Any]) -> Dict[str, Any]:
+        drift_results = {}
+        timeframe = context['extracted_context']['timeframe']
+        
+        if 'drive_date' in data.columns and timeframe['expression'] not in ['not specified', 'default']:
+            try:
+                # Convert to datetime
+                data['drive_date'] = pd.to_datetime(data['drive_date'])
+                
+                # Split into current and reference periods
+                if timeframe['expression'].startswith('last '):
+                    parts = timeframe['expression'].split()
+                    period = int(parts[1])
+                    unit = parts[2] if len(parts) > 2 else 'days'
+                    
+                    if unit in ['days', 'day']:
+                        ref_start = pd.to_datetime(timeframe['start']) - timedelta(days=period)
+                        ref_end = pd.to_datetime(timeframe['start'])
+                    elif unit in ['weeks', 'week']:
+                        ref_start = pd.to_datetime(timeframe['start']) - timedelta(weeks=period)
+                        ref_end = pd.to_datetime(timeframe['start'])
+                    elif unit in ['months', 'month']:
+                        ref_start = pd.to_datetime(timeframe['start']) - timedelta(days=30*period)
+                        ref_end = pd.to_datetime(timeframe['start'])
+                    else:
+                        return {"data_drift": {"error": "Unsupported time unit for drift detection"}}
+                    
+                    current_data = data[data['drive_date'].between(timeframe['start'], timeframe['end'])]
+                    reference_data = data[data['drive_date'].between(ref_start, ref_end)]
+                    
+                    if not current_data.empty and not reference_data.empty:
+                        # Compare distributions (Kolmogorov-Smirnov test)
+                        from scipy.stats import ks_2samp
+                        ks_stat, p_value = ks_2samp(
+                            current_data['efficiency'],
+                            reference_data['efficiency']
+                        )
+                        
+                        drift_results['data_drift'] = {
+                            "current_period": f"{timeframe['start']} to {timeframe['end']}",
+                            "reference_period": f"{ref_start.date()} to {ref_end.date()}",
+                            "ks_statistic": float(ks_stat),
+                            "p_value": float(p_value),
+                            "significant_drift": p_value < 0.05
+                        }
+                
+            except Exception as e:
+                logger.error(f"Error in drift detection: {e}")
+                drift_results['data_drift'] = {"error": str(e)}
+        
+        return drift_results
+
+# 11. Enhanced ReportGenerationAgent
+class ReportGenerationAgent:
+    def __init__(self, config: AEConfig):
+        self.config = config
+        self.llm = ChatGoogleGenerativeAI(
+            model=config.LLM_MODEL,
+            temperature=config.LLM_TEMPERATURE,
+            google_api_key=config.GOOGLE_API_KEY
+        )
+    
+    def generate_report(self, 
+                      analysis_results: Dict[str, Any], 
+                      anomalies: Dict[str, Any],
+                      intents: List[str],
+                      context: Dict[str, Any]) -> Dict[str, Any]:
+        report = {
+            "text": self._generate_text_report(analysis_results, anomalies, intents, context),
+            "visualizations": self._generate_visualizations(analysis_results, intents, context),
+            "download_options": self._generate_download_options(analysis_results, intents)
+        }
+        
+        return report
+    
+    def _generate_text_report(self, 
+                            analysis_results: Dict[str, Any], 
+                            anomalies: Dict[str, Any],
+                            intents: List[str],
+                            context: Dict[str, Any]) -> str:
+        report_parts = []
+        
+        # Header
+        report_parts.append(f"Efficiency Analysis Report")
+        report_parts.append("=" * 40)
+        report_parts.append(f"Query: {context.get('user_query', 'Unknown')}")
+        report_parts.append(f"Timeframe: {context.get('extracted_context', {}).get('timeframe', {}).get('expression', 'Not specified')}")
+        report_parts.append("\n")
+        
+        # Summary
+        report_parts.append("Summary")
+        report_parts.append("-" * 40)
+        
+        if 'error' in analysis_results:
+            report_parts.append(f"Error: {analysis_results['error']}")
+            return "\n".join(report_parts)
+        
+        if 'total_records' in analysis_results:
+            report_parts.append(f"• Total Records Analyzed: {analysis_results['total_records']}")
+        
+        if 'avg_efficiency' in analysis_results:
+            report_parts.append(f"• Average Efficiency: {analysis_results['avg_efficiency']:.2f}")
+        
+        if 'threshold_compliance_rate' in analysis_results:
+            report_parts.append(f"• Threshold Compliance Rate: {analysis_results['threshold_compliance_rate']:.1f}%")
+        
+        # Intent-specific sections
+        if "compare_metric" in intents and "comparisons" in analysis_results:
+            report_parts.append("\nComparison Analysis")
+            report_parts.append("-" * 40)
+            
+            comparisons = analysis_results["comparisons"]
+            if "by_vehicle" in comparisons:
+                report_parts.append("\nBy Vehicle:")
+                for vid, eff in comparisons["by_vehicle"].items():
+                    report_parts.append(f"- {vid}: {eff:.2f}")
+            
+            if "by_region" in comparisons:
+                report_parts.append("\nBy Region:")
+                for region, eff in comparisons["by_region"].items():
+                    report_parts.append(f"- {region}: {eff:.2f}")
+        
+        if "rank_entities" in intents and "rankings" in analysis_results:
+            report_parts.append("\nRankings")
+            report_parts.append("-" * 40)
+            
+            rankings = analysis_results["rankings"]
+            if "top_vehicles" in rankings:
+                report_parts.append("\nTop Vehicles by Efficiency:")
+                for vid, eff in rankings["top_vehicles"].items():
+                    report_parts.append(f"- {vid}: {eff:.2f}")
+            
+            if "bottom_vehicles" in rankings:
+                report_parts.append("\nBottom Vehicles by Efficiency:")
+                for vid, eff in rankings["bottom_vehicles"].items():
+                    report_parts.append(f"- {vid}: {eff:.2f}")
+        
+        if "trend_analysis" in intents and "trends" in analysis_results:
+            report_parts.append("\nTrend Analysis")
+            report_parts.append("-" * 40)
+            
+            trends = analysis_results["trends"]
+            if "monthly_trend" in trends:
+                report_parts.append("\nMonthly Efficiency Trend:")
+                for month, eff in trends["monthly_trend"].items():
+                    report_parts.append(f"- {month}: {eff:.2f}")
+        
+        if "diagnose_metric" in intents and "diagnosis" in analysis_results:
+            report_parts.append("\nDiagnosis")
+            report_parts.append("-" * 40)
+            report_parts.append(analysis_results["diagnosis"])
+        
+        if "get_recommendation" in intents and "recommendations" in analysis_results:
+            report_parts.append("\nRecommendations")
+            report_parts.append("-" * 40)
+            report_parts.append(analysis_results["recommendations"])
+        
+        # Anomalies
+        report_parts.append("\nAnomaly Detection")
+        report_parts.append("-" * 40)
+        
+        if "statistical_anomalies" in anomalies:
+            stats = anomalies["statistical_anomalies"]
+            report_parts.append(f"• Statistical Anomalies Detected: {stats.get('anomaly_count', 0)}")
+            report_parts.append(f"• Anomaly Rate: {stats.get('anomaly_rate', 0):.1%}")
+            
+            if "anomaly_records" in stats and stats["anomaly_records"]:
+                report_parts.append("\nAnomaly Details:")
+                for record in stats["anomaly_records"][:5]:  # Show first 5
+                    report_parts.append(f"- {record.get('vehicle_id', 'Unknown')}: Efficiency {record.get('efficiency', 0):.2f} (z-score: {record.get('z_score', 0):.2f})")
+        
+        if "data_drift" in anomalies:
+            drift = anomalies["data_drift"]
+            if "significant_drift" in drift:
+                report_parts.append(f"\n• Data Drift: {'Significant' if drift['significant_drift'] else 'No significant'} drift detected")
+                report_parts.append(f"  (p-value: {drift.get('p_value', 0):.4f})")
+        
+        # Data Quality
+        if "data_quality" in anomalies:
+            quality = anomalies["data_quality"]
+            report_parts.append("\nData Quality")
+            report_parts.append("-" * 40)
+            
+            if "missing_values" in quality and quality["missing_values"]:
+                report_parts.append("Missing Values:")
+                for col, count in quality["missing_values"].items():
+                    report_parts.append(f"- {col}: {count}")
+            
+            if "duplicate_records" in quality:
+                report_parts.append(f"Duplicate Records: {quality['duplicate_records']}")
+            
+            if "invalid_efficiency" in quality:
+                report_parts.append(f"Invalid Efficiency Values: {quality['invalid_efficiency']}")
+        
+        return "\n".join(report_parts)
+    
+    def _generate_visualizations(self, 
+                               analysis_results: Dict[str, Any], 
+                               intents: List[str],
+                               context: Dict[str, Any]) -> Dict[str, Any]:
+        visualizations = {}
+        
+        if "generate_chart" not in intents:
+            return {"message": "Visualizations can be generated by including 'generate_chart' in your query"}
+        
+        try:
+            # Trend visualization
+            if "trend_analysis" in intents and "trends" in analysis_results:
+                trends = analysis_results["trends"]
+                if "monthly_trend" in trends:
+                    df = pd.DataFrame({
+                        'month': list(trends["monthly_trend"].keys()),
+                        'efficiency': list(trends["monthly_trend"].values())
+                    })
+                    
+                    fig = px.line(
+                        df, 
+                        x='month', 
+                        y='efficiency',
+                        title='Efficiency Trend Over Time',
+                        labels={'month': 'Month', 'efficiency': 'Efficiency'}
+                    )
+                    
+                    visualizations['trend_chart'] = fig.to_json()
+            
+            # Comparison visualization
+            if "compare_metric" in intents and "comparisons" in analysis_results:
+                comparisons = analysis_results["comparisons"]
+                if "by_region" in comparisons:
+                    df = pd.DataFrame({
+                        'region': list(comparisons["by_region"].keys()),
+                        'efficiency': list(comparisons["by_region"].values())
+                    })
+                    
+                    fig = px.bar(
+                        df,
+                        x='region',
+                        y='efficiency',
+                        title='Efficiency by Region',
+                        labels={'region': 'Region', 'efficiency': 'Efficiency'}
+                    )
+                    
+                    visualizations['comparison_chart'] = fig.to_json()
+            
+            # Distribution visualization
+            if 'efficiency' in analysis_results.get('basic_metrics', {}):
+                fig = px.histogram(
+                    x=analysis_results['basic_metrics']['efficiency_values'],
+                    title='Efficiency Distribution',
+                    labels={'x': 'Efficiency', 'y': 'Count'}
+                )
+                
+                visualizations['distribution_chart'] = fig.to_json()
+        
+        except Exception as e:
+            logger.error(f"Error generating visualizations: {e}")
+            visualizations['error'] = str(e)
+        
+        return visualizations
+    
+    def _generate_download_options(self, 
+                                 analysis_results: Dict[str, Any], 
+                                 intents: List[str]) -> Dict[str, Any]:
+        if "download_report" not in intents:
+            return {"message": "Download options can be generated by including 'download_report' in your query"}
+        
+        download_options = {
+            "formats": ["csv", "json", "pdf"],
+            "instructions": "Specify which format you'd like to download"
+        }
+        
+        return download_options
+    
+    def generate_download(self, 
+                        analysis_results: Dict[str, Any], 
+                        format: Literal["csv", "json", "pdf"]) -> Dict[str, Any]:
+        try:
+            if format == "csv":
+                # Convert analysis results to CSV
+                csv_data = ""
+                for section, content in analysis_results.items():
+                    if isinstance(content, dict):
+                        df = pd.DataFrame(content)
+                        csv_data += f"{section}\n{df.to_csv()}\n\n"
+                
+                return {
+                    "format": "csv",
+                    "data": csv_data,
+                    "filename": f"efficiency_report_{datetime.now().strftime('%Y%m%d')}.csv"
+                }
+            
+            elif format == "json":
+                return {
+                    "format": "json",
+                    "data": json.dumps(analysis_results, indent=2),
+                    "filename": f"efficiency_report_{datetime.now().strftime('%Y%m%d')}.json"
+                }
+            
+            elif format == "pdf":
+                # In a real implementation, use a PDF generation library
+                return {
+                    "format": "pdf",
+                    "message": "PDF generation would be implemented with a library like WeasyPrint or ReportLab",
+                    "filename": f"efficiency_report_{datetime.now().strftime('%Y%m%d')}.pdf"
+                }
+            
+            else:
+                raise ValueError(f"Unsupported format: {format}")
+                
+        except Exception as e:
+            logger.error(f"Error generating download: {e}")
+            return {"error": str(e)}
+
+# 12. LangGraph-Based Manager Agent
+class ManagerAgent:
+    def __init__(self, config: AEConfig):
+        self.config = config
+        
+        # Initialize all agents
+        self.query_agent = QueryUnderstandingAgent(config)
+        self.data_agent = DataRetrievalAgent(config)
+        self.analysis_agent = AnalysisAgent(config)
+        self.anomaly_agent = AnomalyDetectionAgent(config)
+        self.report_agent = ReportGenerationAgent(config)
+        
+        # Define the workflow graph
+        self.workflow = Graph()
+        
+        # Add nodes
+        self.workflow.add_node("query_understanding", self.query_understanding_node)
+        self.workflow.add_node("data_retrieval", self.data_retrieval_node)
+        self.workflow.add_node("basic_analysis", self.basic_analysis_node)
+        self.workflow.add_node("advanced_analysis", self.advanced_analysis_node)
+        self.workflow.add_node("anomaly_detection", self.anomaly_detection_node)
+        self.workflow.add_node("report_generation", self.report_generation_node)
+        self.workflow.add_node("error_handler", self.error_handler_node)
+        
+        # Define edges
+        self.workflow.add_edge("query_understanding", "data_retrieval")
+        self.workflow.add_edge("data_retrieval", "basic_analysis")
+        
+        # Conditional edges from basic analysis
+        self.workflow.add_conditional_edges(
+            "basic_analysis",
+            self.decide_advanced_analysis,
+            {
+                "advanced": "advanced_analysis",
+                "skip": "anomaly_detection"
+            }
+        )
+        
+        self.workflow.add_edge("advanced_analysis", "anomaly_detection")
+        self.workflow.add_edge("anomaly_detection", "report_generation")
+        
+        # Error handling edges
+        self.workflow.add_edge("error_handler", "report_generation")
+        
+        # Set entry and end points
+        self.workflow.set_entry_point("query_understanding")
+        self.workflow.set_finish_point("report_generation")
+        
+        # Compile the graph
+        self.app = self.workflow.compile()
+    
+    def query_understanding_node(self, state: Dict[str, Any]) -> Dict[str, Any]:
+        try:
+            user_query = state["user_query"]
+            logger.info(f"Processing query: {user_query}")
+            
+            context = self.query_agent.process_query(user_query)
+            return {"query_context": context}
+        
+        except Exception as e:
+            logger.error(f"Query understanding failed: {e}")
+            return {"error": str(e), "error_step": "query_understanding"}
+    
+    def data_retrieval_node(self, state: Dict[str, Any]) -> Dict[str, Any]:
+        if "error" in state:
+            return state
+            
+        try:
+            context = state["query_context"]
+            data_source = state.get("data_source") or self.config.DEFAULT_DATA_SOURCE
+            
+            data = self.data_agent.retrieve_data(context, data_source)
+            return {"retrieved_data": data}
+        
+        except Exception as e:
+            logger.error(f"Data retrieval failed: {e}")
+            return {"error": str(e), "error_step": "data_retrieval"}
+    
+    def basic_analysis_node(self, state: Dict[str, Any]) -> Dict[str, Any]:
+        if "error" in state:
+            return state
+            
+        try:
+            data = state["retrieved_data"]
+            context = state["query_context"]
+            
+            # Always perform basic analysis
+            basic_results = self.analysis_agent._calculate_basic_metrics(data)
+            return {
+                "analysis_results": {"basic_metrics": basic_results},
+                "query_context": context
+            }
+        
+        except Exception as e:
+            logger.error(f"Basic analysis failed: {e}")
+            return {"error": str(e), "error_step": "basic_analysis"}
+    
+    def decide_advanced_analysis(self, state: Dict[str, Any]) -> str:
+        if "error" in state:
+            return "skip"
+            
+        context = state["query_context"]
+        intents = context.get("intents", [])
+        
+        # Skip advanced analysis if only basic intents are present
+        basic_intents = {"fetch_metric", "threshold_check"}
+        if all(intent in basic_intents for intent in intents):
+            return "skip"
+            
+        return "advanced"
+    
+    def advanced_analysis_node(self, state: Dict[str, Any]) -> Dict[str, Any]:
+        if "error" in state:
+            return state
+            
+        try:
+            data = state["retrieved_data"]
+            context = state["query_context"]
+            intents = context.get("intents", [])
+            
+            # Perform intent-specific advanced analysis
+            advanced_results = self.analysis_agent.analyze(data, intents, context)
+            
+            # Merge with existing results
+            current_results = state.get("analysis_results", {})
+            current_results.update(advanced_results)
+            
+            return {
+                "analysis_results": current_results,
+                "query_context": context
+            }
+        
+        except Exception as e:
+            logger.error(f"Advanced analysis failed: {e}")
+            return {"error": str(e), "error_step": "advanced_analysis"}
+    
+    def anomaly_detection_node(self, state: Dict[str, Any]) -> Dict[str, Any]:
+        if "error" in state:
+            return state
+            
+        try:
+            data = state["retrieved_data"]
+            context = state["query_context"]
+            
+            anomalies = self.anomaly_agent.detect_anomalies(data, context)
+            return {
+                "anomalies": anomalies,
+                "analysis_results": state["analysis_results"],
+                "query_context": context
+            }
+        
+        except Exception as e:
+            logger.error(f"Anomaly detection failed: {e}")
+            return {"error": str(e), "error_step": "anomaly_detection"}
+    
+    def report_generation_node(self, state: Dict[str, Any]) -> Dict[str, Any]:
+        if "error" in state:
+            # Even if there's an error, try to generate a report with the error
+            error_report = {
+                "text": f"Error during processing:\nStep: {state.get('error_step', 'unknown')}\nError: {state.get('error', 'Unknown error')}",
+                "visualizations": {},
+                "download_options": {}
+            }
+            return {"report": error_report}
+            
+        try:
+            analysis_results = state["analysis_results"]
+            anomalies = state["anomalies"]
+            context = state["query_context"]
+            intents = context.get("intents", [])
+            
+            report = self.report_agent.generate_report(
+                analysis_results, 
+                anomalies,
+                intents,
+                context
+            )
+            
+            return {"report": report}
+        
+        except Exception as e:
+            logger.error(f"Report generation failed: {e}")
+            error_report = {
+                "text": f"Error generating report: {str(e)}",
+                "visualizations": {},
+                "download_options": {}
+            }
+            return {"report": error_report}
+    
+    def error_handler_node(self, state: Dict[str, Any]) -> Dict[str, Any]:
+        error = state.get("error", "Unknown error")
+        error_step = state.get("error_step", "unknown step")
+        
+        logger.error(f"Error in {error_step}: {error}")
+        
+        return {
+            "error": error,
+            "error_step": error_step
+        }
+    
+    def run(self, user_query: str, data_source: Optional[DataSourceType] = None) -> Dict[str, Any]:
+        # Initialize state
+        initial_state = {
+            "user_query": user_query,
+            "data_source": data_source
+        }
+        
+        # Execute the graph
+        final_state = self.app.invoke(initial_state)
+        
+        # Prepare final response
+        response = {
+            "report": final_state.get("report", {}),
+            "status": "error" if "error" in final_state else "success",
+            "query_context": final_state.get("query_context")
+        }
+        
+        if "error" in final_state:
+            response["error"] = final_state["error"]
+            response["error_step"] = final_state.get("error_step")
+        
+        return response
+
+# 13. Usage Example
+if __name__ == "__main__":
+    try:
+        # Initialize configuration
+        config = AEConfig(
+            GOOGLE_API_KEY=os.getenv("GOOGLE_API_KEY", "your-api-key"),
+            GOOGLE_SHEET_ID="your-sheet-id",
+            BIGQUERY_PROJECT_ID="your-project-id",
+            SEMANTIC_LAYER_PATH="semantic_layer.yaml"
+        )
+        
+        # Initialize manager
+        manager = ManagerAgent(config)
+        
+        # Example queries
+        queries = [
+            "Show efficiency for the last quarter by region",
+            "Compare efficiency between US and JP vehicles and show anomalies",
+            "List top 5 vehicles by efficiency this year and forecast next quarter",
+            "Why is efficiency low for vehicle VID123? Provide recommendations",
+            "Show trend of efficiency over the past 6 months and generate a chart"
+        ]
+        
+        # Process each query
+        for query in queries:
+            logger.info(f"\nProcessing query: {query}")
+            result = manager.run(query)
+            
+            if result["status"] == "success":
+                print("\nReport:")
+                print(result["report"]["text"])
+                
+                if "visualizations" in result["report"]:
+                    print("\nVisualizations available for:", list(result["report"]["visualizations"].keys()))
+                
+                if "download_options" in result["report"]:
+                    print("\nDownload options:", result["report"]["download_options"])
+            else:
+                print(f"\nError processing query: {result.get('error', 'Unknown error')}")
+                print(f"Error occurred during: {result.get('error_step', 'unknown step')}")
+                
+    except Exception as e:
+        logger.error(f"Application error: {e}")
+        raise
