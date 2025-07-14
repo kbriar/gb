@@ -1,0 +1,349 @@
+class AnalysisAgent:
+    def __init__(self, semantic_layer_manager):
+        self.semantic_layer = semantic_layer_manager
+
+    def analyze_data(self, df, query_result):
+        if df is None or df.empty:
+            return {"error": "No data found for the specified criteria"}
+        intent = query_result.intent
+        context = query_result.extracted_context
+        if intent == IntentType.FETCH_METRIC:
+            return self._fetch_metric(df, context)
+        elif intent == IntentType.COMPARE_METRIC:
+            return self._compare_metric(df, context)
+        elif intent == IntentType.RANK_ENTITIES:
+            return self._rank_entities(df, context)
+        elif intent == IntentType.DIAGNOSE_METRIC:
+            return self._diagnose_metric(df, context)
+        elif intent == IntentType.TREND_ANALYSIS:
+            return self._trend_analysis(df, context)
+        elif intent == IntentType.THRESHOLD_CHECK:
+            return self._threshold_check(df, context)
+        elif intent == IntentType.LIST_ENTITIES_BY_CRITERIA:
+            return self._list_entities_by_criteria(df, context)
+        elif intent == IntentType.SUMMARIZE_METRIC:
+            return self._summarize_metric(df, context)
+        elif intent == IntentType.GET_RECOMMENDATION:
+            return self._get_recommendation(df, context)
+        else:
+            return self._fetch_metric(df, context)
+
+    def _fetch_metric(self, df, context):
+        metric = context.metrics[0] if context.metrics else "efficiency"
+        if metric == "efficiency":
+            overall_eff = df["Targetdistance"].sum() / df["Totaldistance"].sum()
+            return {"overall_efficiency": overall_eff}
+        return {"error": "Metric not supported"}
+
+    def _compare_metric(self, df, context):
+        dimension = None
+        for col in ["region", "country_code", "vehicle_id", "user_email"]:
+            if col in df.columns:
+                dimension = col
+                break
+        if not dimension:
+            return {"error": "No dimension found for comparison"}
+        grouped = df.groupby(dimension).agg({"Targetdistance": "sum", "Totaldistance": "sum"})
+        grouped["efficiency"] = grouped["Targetdistance"] / grouped["Totaldistance"]
+        values = grouped["efficiency"].to_dict()
+        best = grouped["efficiency"].idxmax()
+        worst = grouped["efficiency"].idxmin()
+        return {
+            "comparisons": [{
+                "dimension": dimension,
+                "values": values,
+                "best_performer": best,
+                "worst_performer": worst
+            }]
+        }
+
+    def _rank_entities(self, df, context):
+        dimension = None
+        for col in ["region", "country_code", "vehicle_id", "user_email"]:
+            if col in df.columns:
+                dimension = col
+                break
+        if not dimension:
+            return {"error": "No dimension found for ranking"}
+        grouped = df.groupby(dimension).agg({"Targetdistance": "sum", "Totaldistance": "sum"})
+        grouped["efficiency"] = grouped["Targetdistance"] / grouped["Totaldistance"]
+        ranked = grouped["efficiency"].sort_values(ascending=False)
+        top = ranked.head(3).to_dict()
+        bottom = ranked.tail(3).to_dict()
+        return {
+            dimension: {
+                "top_performers": top,
+                "bottom_performers": bottom
+            }
+        }
+
+    def _diagnose_metric(self, df, context):
+        overall_eff = df["Targetdistance"].sum() / df["Totaldistance"].sum()
+        distribution = {
+            "min": df["efficiency"].min(),
+            "max": df["efficiency"].max(),
+            "mean": df["efficiency"].mean(),
+            "std": df["efficiency"].std()
+        }
+        factors = []
+        if overall_eff < 0.5:
+            factors.append({"description": "Low overall efficiency. Possible causes: high idle time, route inefficiency."})
+        if df["efficiency"].max() > 1.5:
+            factors.append({"description": "Some trips have unusually high efficiency. Check data quality or exceptional trips."})
+        return {
+            "overall_efficiency": overall_eff,
+            "efficiency_distribution": distribution,
+            "factors": factors
+        }
+
+    def _trend_analysis(self, df, context):
+        if "d_month" in df.columns:
+            group_col = "d_month"
+        elif "d_date" in df.columns:
+            group_col = "d_date"
+        else:
+            return {"error": "No date column for trend analysis"}
+        monthly = df.groupby(group_col).agg({"Targetdistance": "sum", "Totaldistance": "sum"})
+        monthly["efficiency"] = monthly["Targetdistance"] / monthly["Totaldistance"]
+        trend = "upward" if monthly["efficiency"].iloc[-1] > monthly["efficiency"].iloc[0] else "downward"
+        monthly_data = {str(idx): {"efficiency": val} for idx, val in monthly["efficiency"].items()}
+        return {
+            "trend_direction": trend,
+            "monthly_data": monthly_data
+        }
+
+    def _threshold_check(self, df, context):
+        overall_eff = df["Targetdistance"].sum() / df["Totaldistance"].sum()
+        checks = []
+        for threshold in [0.2, 0.5, 1.0]:
+            checks.append({
+                "threshold": f"Efficiency > {threshold}",
+                "passed": overall_eff > threshold,
+                "current": overall_eff,
+                "value": threshold
+            })
+        return {
+            "overall_efficiency": overall_eff,
+            "threshold_checks": checks
+        }
+
+    def _list_entities_by_criteria(self, df, context):
+        result = {}
+        total = 0
+        for col in ["region", "country_code", "vehicle_id", "user_email"]:
+            if col in df.columns:
+                filtered = df[df["efficiency"] > 0.8]
+                entities = filtered.groupby(col)["efficiency"].mean()
+                result[col] = entities.to_dict()
+                total += len(entities)
+        return {
+            "entities": result,
+            "total_matching": total
+        }
+
+    def _summarize_metric(self, df, context):
+        summary = {
+            "overall_summary": {
+                "overall_efficiency": df["Targetdistance"].sum() / df["Totaldistance"].sum()
+            },
+            "statistical_summary": {
+                "min": df["efficiency"].min(),
+                "max": df["efficiency"].max(),
+                "mean": df["efficiency"].mean(),
+                "std": df["efficiency"].std()
+            }
+        }
+        return summary
+
+    def _get_recommendation(self, df, context):
+        recommendations = []
+        overall_eff = df["Targetdistance"].sum() / df["Totaldistance"].sum()
+        if overall_eff < 0.5:
+            recommendations.append({
+                "title": "Improve Efficiency",
+                "description": "Overall efficiency is low. Focus on route optimization and reducing idle time.",
+                "action_items": [
+                    "Analyze underperforming regions.",
+                    "Review driver training.",
+                    "Optimize vehicle assignment."
+                ]
+            })
+        else:
+            recommendations.append({
+                "title": "Maintain Performance",
+                "description": "Efficiency is within acceptable range.",
+                "action_items": [
+                    "Continue monitoring.",
+                    "Identify best practices from top performers."
+                ]
+            })
+        return {"recommendations": recommendations}
+
+
+class AnomalyDetectionAgent:
+    def detect_anomalies(self, df):
+        if df is None or df.empty:
+            return []
+        anomalies = []
+        z = (df["efficiency"] - df["efficiency"].mean()) / df["efficiency"].std()
+        for idx, val in z.items():
+            if abs(val) > 2:
+                anomalies.append({
+                    "type": "z_score_outlier",
+                    "description": f"Efficiency z-score {val:.2f} (outlier)",
+                    "entity": df.iloc[idx].get("vehicle_id", "unknown"),
+                    "date": str(df.iloc[idx].get("d_date", ""))
+                })
+        for idx, row in df.iterrows():
+            if row["efficiency"] < 0.2:
+                anomalies.append({
+                    "type": "low_efficiency",
+                    "description": "Efficiency below 20%",
+                    "entity": row.get("vehicle_id", "unknown"),
+                    "date": str(row.get("d_date", ""))
+                })
+        return anomalies
+
+
+class ReportGenerationAgent:
+    def generate_report(self, query_result, analysis_results, anomalies):
+        intent = query_result.intent
+        if intent == IntentType.FETCH_METRIC:
+            return self._generate_fetch_metric_report(query_result, analysis_results, anomalies)
+        elif intent == IntentType.COMPARE_METRIC:
+            return self._generate_compare_metric_report(query_result, analysis_results, anomalies)
+        elif intent == IntentType.RANK_ENTITIES:
+            return self._generate_rank_entities_report(query_result, analysis_results, anomalies)
+        elif intent == IntentType.DIAGNOSE_METRIC:
+            return self._generate_diagnose_metric_report(query_result, analysis_results, anomalies)
+        elif intent == IntentType.TREND_ANALYSIS:
+            return self._generate_trend_analysis_report(query_result, analysis_results, anomalies)
+        elif intent == IntentType.THRESHOLD_CHECK:
+            return self._generate_threshold_check_report(query_result, analysis_results, anomalies)
+        elif intent == IntentType.LIST_ENTITIES_BY_CRITERIA:
+            return self._generate_list_entities_report(query_result, analysis_results, anomalies)
+        elif intent == IntentType.SUMMARIZE_METRIC:
+            return self._generate_summarize_metric_report(query_result, analysis_results, anomalies)
+        elif intent == IntentType.GET_RECOMMENDATION:
+            return self._generate_recommendation_report(query_result, analysis_results, anomalies)
+        else:
+            return self._generate_default_report(query_result, analysis_results, anomalies)
+
+    def _generate_fetch_metric_report(self, query_result, analysis_results, anomalies):
+        if "error" in analysis_results:
+            return f"Error: {analysis_results['error']}"
+        eff = analysis_results.get("overall_efficiency", None)
+        if eff is not None:
+            report = f"Efficiency Report\n\nOverall Efficiency: {eff:.1%}\n"
+        else:
+            report = "No efficiency data available.\n"
+        if anomalies:
+            report += self._generate_anomalies_section(anomalies)
+        return report
+
+    def _generate_compare_metric_report(self, query_result, analysis_results, anomalies):
+        if "error" in analysis_results:
+            return f"Error: {analysis_results['error']}"
+        report = "Efficiency Comparison\n\n"
+        for comp in analysis_results.get("comparisons", []):
+            report += f"Comparison by {comp['dimension'].capitalize()}\n"
+            for entity, value in comp["values"].items():
+                report += f"- {entity}: {value:.1%}\n"
+            if "best_performer" in comp:
+                report += f"\nBest Performer: {comp['best_performer']}\n"
+            if "worst_performer" in comp:
+                report += f"Worst Performer: {comp['worst_performer']}\n"
+            if "trend" in comp:
+                report += f"Trend: {comp['trend']}\n"
+            report += "\n"
+        return report
+
+    def _generate_rank_entities_report(self, query_result, analysis_results, anomalies):
+        if "error" in analysis_results:
+            return f"Error: {analysis_results['error']}"
+        report = "Entity Rankings\n\n"
+        for key, ranking in analysis_results.items():
+            report += f"{key.replace('_', ' ').title()}\n"
+            report += "Top Performers:\n"
+            for entity, value in ranking["top_performers"].items():
+                report += f"- {entity}: {value:.1%}\n"
+            report += "Bottom Performers:\n"
+            for entity, value in ranking["bottom_performers"].items():
+                report += f"- {entity}: {value:.1%}\n"
+            report += "\n"
+        return report
+
+    def _generate_diagnose_metric_report(self, query_result, analysis_results, anomalies):
+        if "error" in analysis_results:
+            return f"Error: {analysis_results['error']}"
+        report = "Metric Diagnosis\n\n"
+        report += f"Overall Efficiency: {analysis_results['overall_efficiency']:.2%}\n\n"
+        report += "Efficiency Distribution:\n"
+        for k, v in analysis_results["efficiency_distribution"].items():
+            report += f"- {k}: {v:.3f}\n"
+        report += "\nKey Factors:\n"
+        for factor in analysis_results["factors"]:
+            report += f"- {factor['description']}\n"
+        return report
+
+    def _generate_trend_analysis_report(self, query_result, analysis_results, anomalies):
+        if "error" in analysis_results:
+            return f"Error: {analysis_results['error']}"
+        report = "Trend Analysis\n\n"
+        report += f"Trend Direction: {analysis_results['trend_direction'].capitalize()}\n"
+        report += "\nMonthly Data:\n"
+        for month, stats in analysis_results["monthly_data"].items():
+            report += f"- {month}: {stats['efficiency']:.1%}\n"
+        return report
+
+    def _generate_threshold_check_report(self, query_result, analysis_results, anomalies):
+        if "error" in analysis_results:
+            return f"Error: {analysis_results['error']}"
+        report = "Threshold Check\n\n"
+        report += f"Overall Efficiency: {analysis_results['overall_efficiency']:.1%}\n"
+        for check in analysis_results["threshold_checks"]:
+            status = "PASS" if check["passed"] else "FAIL"
+            report += f"{status} {check['threshold']}: {check['current']:.1%} (Target: {check['value']:.1%})\n"
+        return report
+
+    def _generate_list_entities_report(self, query_result, analysis_results, anomalies):
+        if "error" in analysis_results:
+            return f"Error: {analysis_results['error']}"
+        report = "Entities Meeting Criteria\n\n"
+        for entity_type, entities in analysis_results["entities"].items():
+            report += f"{entity_type.title()}\n"
+            for entity, value in entities.items():
+                report += f"- {entity}: {value:.1%}\n"
+        report += f"\nTotal Matching: {analysis_results['total_matching']}\n"
+        return report
+
+    def _generate_summarize_metric_report(self, query_result, analysis_results, anomalies):
+        if "error" in analysis_results:
+            return f"Error: {analysis_results['error']}"
+        summary = analysis_results
+        report = "Summary Statistics\n\n"
+        report += f"Overall Efficiency: {summary['overall_summary']['overall_efficiency']:.2%}\n"
+        for k, v in summary["statistical_summary"].items():
+            report += f"- {k}: {v:.3f}\n"
+        return report
+
+    def _generate_recommendation_report(self, query_result, analysis_results, anomalies):
+        if "error" in analysis_results:
+            return f"Error: {analysis_results['error']}"
+        report = "Recommendations\n\n"
+        for rec in analysis_results["recommendations"]:
+            report += f"{rec['title']}\n"
+            report += f"{rec['description']}\n"
+            for item in rec["action_items"]:
+                report += f"- {item}\n"
+            report += "\n"
+        return report
+
+    def _generate_anomalies_section(self, anomalies):
+        report = "\nAnomalies Detected\n"
+        for anomaly in anomalies:
+            report += f"- [{anomaly['type'].replace('_', ' ').title()}] {anomaly['description']} (Entity: {anomaly['entity']}, Date: {anomaly['date']})\n"
+        return report
+
+    def _generate_default_report(self, query_result, analysis_results, anomalies):
+        return self._generate_fetch_metric_report(query_result, analysis_results, anomalies)
