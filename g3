@@ -1,0 +1,99 @@
+
+    def __init__(self):
+        self.now = datetime(2025, 7, 17, 1, 39)  # 01:39 AM IST, July 17, 2025 (21:09 UTC, July 16, 2025)
+
+    def parse_time_expression(self, expression: str, reference_date: Optional[datetime] = None) -> Dict[str, str]:
+        if not reference_date:
+            reference_date = self.now
+        lower_expr = expression.lower().strip()  # Remove leading/trailing spaces
+        print(f"Parsing expression: '{lower_expr}' with reference_date: {reference_date}")
+
+        special_cases = {
+            "this week": lambda ref: {
+                "start": (ref - timedelta(days=ref.weekday())).strftime("%Y-%m-%d"),
+                "end": (ref + timedelta(days=(6 - ref.weekday()))).strftime("%Y-%m-%d")
+            },
+            "last week": lambda ref: {
+                "start": (ref - timedelta(days=ref.weekday() + 7)).strftime("%Y-%m-%d"),
+                "end": (ref - timedelta(days=ref.weekday() + 1)).strftime("%Y-%m-%d")
+            },
+            "this month": lambda ref: {
+                "start": ref.replace(day=1).strftime("%Y-%m-%d"),
+                "end": (ref.replace(day=28) + timedelta(days=4)).replace(day=1) - timedelta(days=1).strftime("%Y-%m-%d")
+            },
+            "last month": lambda ref: {
+                "start": (ref.replace(day=1) - timedelta(days=1)).replace(day=1).strftime("%Y-%m-%d"),
+                "end": (ref.replace(day=1) - timedelta(days=1)).strftime("%Y-%m-%d")
+            },
+            "previous": lambda ref: {
+                "start": (ref.replace(day=1) - timedelta(days=1)).replace(day=1).strftime("%Y-%m-%d"),
+                "end": (ref.replace(day=1) - timedelta(days=1)).strftime("%Y-%m-%d")
+            },
+            "this year": lambda ref: {
+                "start": ref.replace(month=1, day=1).strftime("%Y-%m-%d"),
+                "end": ref.replace(month=12, day=31).strftime("%Y-%m-%d")
+            },
+            "last year": lambda ref: {
+                "start": ref.replace(year=ref.year - 1, month=1, day=1).strftime("%Y-%m-%d"),
+                "end": ref.replace(year=ref.year - 1, month=12, day=31).strftime("%Y-%m-%d")
+            },
+            "this quarter": lambda ref: {
+                "start": ref.replace(month=((ref.month - 1) // 3 * 3 + 1), day=1).strftime("%Y-%m-%d"),
+                "end": (ref.replace(month=((ref.month - 1) // 3 * 3 + 4), day=1) - timedelta(days=1)).strftime("%Y-%m-%d")
+            },
+            "last quarter": lambda ref: {
+                "start": (ref.replace(month=((ref.month - 1) // 3 * 3 + 1), day=1) - timedelta(days=92)).replace(day=1).strftime("%Y-%m-%d"),
+                "end": (ref.replace(month=((ref.month - 1) // 3 * 3 + 1), day=1) - timedelta(days=1)).strftime("%Y-%m-%d")
+            },
+            "till now": lambda ref: {"start": "1970-01-01", "end": ref.strftime("%Y-%m-%d")},
+            "till date": lambda ref: {"start": "1970-01-01", "end": ref.strftime("%Y-%m-%d")},
+            "as of yesterday": lambda ref: {"start": "1970-01-01", "end": (ref - timedelta(days=1)).strftime("%Y-%m-%d")}
+        }
+
+        # Handle generic "last/past N months/years" with flexible spacing and units
+        range_match = re.search(r"(?:last|past)\s+(\d+)\s+(?:month|months|year|years)", lower_expr)
+        print(f"range_match: {range_match}")
+        if range_match:
+            num = int(range_match.group(1))
+            unit = range_match.group(2)
+            print(f"Matched: num={num}, unit={unit}")
+            if unit.startswith("month"):
+                # Use month arithmetic for accuracy
+                start_month = reference_date.replace(day=1) - timedelta(days=(num * 30))
+                start = start_month.replace(day=1)
+                end = (reference_date.replace(day=28) + timedelta(days=4)).replace(day=1) - timedelta(days=1)
+                return {
+                    "start": start.strftime("%Y-%m-%d"),
+                    "end": end.strftime("%Y-%m-%d")
+                }
+            elif unit.startswith("year"):
+                start = reference_date.replace(year=reference_date.year - num, month=1, day=1)
+                end = reference_date.replace(month=12, day=31)
+                return {
+                    "start": start.strftime("%Y-%m-%d"),
+                    "end": end.strftime("%Y-%m-%d")
+                }
+
+        # Handle specific month-year
+        month_match = re.search(r"(january|jan|february|feb|march|mar|april|apr|may|june|jun|july|jul|august|aug|september|sep|october|oct|november|nov|december|dec)\s+(\d{4})", lower_expr)
+        if month_match:
+            month_name = month_match.group(1)
+            year = int(month_match.group(2))
+            month_num = {
+                "january": 1, "jan": 1, "february": 2, "feb": 2, "march": 3, "mar": 3,
+                "april": 4, "apr": 4, "may": 5, "june": 6, "jun": 6, "july": 7, "jul": 7,
+                "august": 8, "aug": 8, "september": 9, "sep": 9, "october": 10, "oct": 10,
+                "november": 11, "nov": 11, "december": 12, "dec": 12
+            }[month_name]
+            start = datetime(year, month_num, 1)
+            end = (start.replace(month=month_num % 12 + 1, day=1) - timedelta(days=1))
+            return {"start": start.strftime("%Y-%m-%d"), "end": end.strftime("%Y-%m-%d")}
+
+        # Handle special cases
+        for expr, func in special_cases.items():
+            if expr in lower_expr:
+                print(f"Matched special case: {expr}")
+                return func(reference_date)
+
+        print(f"No match found for '{lower_expr}'")
+        return None
