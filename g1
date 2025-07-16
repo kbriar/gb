@@ -1,0 +1,300 @@
+# Required imports
+from google.colab import auth
+import gspread
+import yaml
+import numpy as np
+from sentence_transformers import SentenceTransformer
+import faiss
+from langchain_google_genai import GoogleGenerativeAIEmbeddings, ChatGoogleGenerativeAI
+from langgraph.graph import StateGraph, END
+from dataclasses import dataclass, asdict
+import json
+from datetime import datetime, timedelta
+import re
+
+# Authenticate Google Colab user
+auth.authenticate_user()
+gc = gspread.authorize(gspread.auth.get_user_auth())
+
+# Load Semantic Layer from external file
+def load_semantic_layer(file_path: str = "semantic_layer.yaml") -> dict:
+    with open(file_path, 'r') as file:
+        return yaml.safe_load(file)
+
+# Intent Enum
+class IntentType:
+    FETCH_METRIC = "fetch_metric"
+    COMPARE_METRIC = "compare_metric"
+    RANK_ENTITIES = "rank_entities"
+    DIAGNOSE_METRIC = "diagnose_metric"
+    TREND_ANALYSIS = "trend_analysis"
+    THRESHOLD_CHECK = "threshold_check"
+    LIST_ENTITIES_BY_CRITERIA = "list_entities_by_criteria"
+    SUMMARIZE_METRIC = "summarize_metric"
+    GET_RECOMMENDATION = "get_recommendation"
+
+# Time Expression Handler
+class TimeExpressionHandler:
+    def __init__(self):
+        self.now = datetime(2025, 7, 16, 14, 59)  # 08:29 PM IST is 14:59 UTC
+
+    def parse_time_expression(self, expression: str) -> Dict[str, str]:
+        special_cases = {
+            "this week": lambda: {
+                "start": (self.now - timedelta(days=self.now.weekday())).strftime("%Y-%m-%d"),
+                "end": (self.now + timedelta(days=(6 - self.now.weekday()))).strftime("%Y-%m-%d")
+            },
+            "last week": lambda: {
+                "start": (self.now - timedelta(days=self.now.weekday() + 7)).strftime("%Y-%m-%d"),
+                "end": (self.now - timedelta(days=self.now.weekday() + 1)).strftime("%Y-%m-%d")
+            },
+            "this month": lambda: {
+                "start": self.now.replace(day=1).strftime("%Y-%m-%d"),
+                "end": (self.now.replace(day=1) + timedelta(days=32)).replace(day=1) - timedelta(days=1).strftime("%Y-%m-%d")
+            },
+            "last month": lambda: {
+                "start": (self.now.replace(day=1) - timedelta(days=1)).replace(day=1).strftime("%Y-%m-%d"),
+                "end": (self.now.replace(day=1) - timedelta(days=1)).strftime("%Y-%m-%d")
+            },
+            "previous": lambda: {
+                "start": (self.now.replace(day=1) - timedelta(days=1)).replace(day=1).strftime("%Y-%m-%d"),
+                "end": (self.now.replace(day=1) - timedelta(days=1)).strftime("%Y-%m-%d")
+            },
+            "this year": lambda: {
+                "start": self.now.replace(month=1, day=1).strftime("%Y-%m-%d"),
+                "end": self.now.replace(month=12, day=31).strftime("%Y-%m-%d")
+            },
+            "last year": lambda: {
+                "start": self.now.replace(year=self.now.year - 1, month=1, day=1).strftime("%Y-%m-%d"),
+                "end": self.now.replace(year=self.now.year - 1, month=12, day=31).strftime("%Y-%m-%d")
+            },
+            "this quarter": lambda: {
+                "start": self.now.replace(month=((self.now.month - 1) // 3 * 3 + 1), day=1).strftime("%Y-%m-%d"),
+                "end": (self.now.replace(month=((self.now.month - 1) // 3 * 3 + 4), day=1) - timedelta(days=1)).strftime("%Y-%m-%d")
+            },
+            "last quarter": lambda: {
+                "start": (self.now.replace(month=((self.now.month - 1) // 3 * 3 + 1), day=1) - timedelta(days=92)).replace(day=1).strftime("%Y-%m-%d"),
+                "end": (self.now.replace(month=((self.now.month - 1) // 3 * 3 + 1), day=1) - timedelta(days=1)).strftime("%Y-%m-%d")
+            },
+            "last 6 months": lambda: {
+                "start": (self.now - timedelta(days=180)).strftime("%Y-%m-%d"),
+                "end": self.now.strftime("%Y-%m-%d")
+            },
+            "last 2 months": lambda: {
+                "start": (self.now - timedelta(days=60)).strftime("%Y-%m-%d"),
+                "end": self.now.strftime("%Y-%m-%d")
+            },
+            "till now": lambda: {"start": "1970-01-01", "end": self.now.strftime("%Y-%m-%d")},
+            "till date": lambda: {"start": "1970-01-01", "end": self.now.strftime("%Y-%m-%d")},
+            "as of yesterday": lambda: {"start": "1970-01-01", "end": (self.now - timedelta(days=1)).strftime("%Y-%m-%d")}
+        }
+
+        lower_expr = expression.lower()
+        for expr, func in special_cases.items():
+            if expr in lower_expr:
+                return func()
+
+        # Handle month-year (e.g., "May 2025", "Jan 2025")
+        month_match = re.search(r"(january|jan|february|feb|march|mar|april|apr|may|june|jun|july|jul|august|aug|september|sep|october|oct|november|nov|december|dec)\s+(\d{4})", lower_expr)
+        if month_match:
+            month_name = month_match.group(1)
+            year = int(month_match.group(2))
+            month_num = {
+                "january": 1, "jan": 1, "february": 2, "feb": 2, "march": 3, "mar": 3,
+                "april": 4, "apr": 4, "may": 5, "june": 6, "jun": 6, "july": 7, "jul": 7,
+                "august": 8, "aug": 8, "september": 9, "sep": 9, "october": 10, "oct": 10,
+                "november": 11, "nov": 11, "december": 12, "dec": 12
+            }[month_name]
+            start = datetime(year, month_num, 1)
+            end = (start.replace(month=month_num % 12 + 1, day=1) - timedelta(days=1))
+            return {"start": start.strftime("%Y-%m-%d"), "end": end.strftime("%Y-%m-%d")}
+
+        return None
+
+# Vector Store
+class VectorStore:
+    def __init__(self, embeddings):
+        self.embeddings = embeddings
+        self.index = None
+        self.queries = []
+
+    def add_queries(self, queries: List[str]):
+        self.queries.extend(queries)
+        query_embeddings = self.embeddings.embed_documents(queries)
+        if self.index is None:
+            dim = len(query_embeddings[0])
+            self.index = faiss.IndexHNSWFlat(dim, 32)
+            self.index.add(np.array(query_embeddings).astype('float32'))
+        else:
+            self.index.add(np.array(query_embeddings).astype('float32'))
+
+    def search(self, query: str, k: int = 3) -> List[Dict[str, str]]:
+        query_embedding = self.embeddings.embed_query(query)
+        distances, indices = self.index.search(np.array([query_embedding]).astype('float32'), k)
+        results = []
+        for i, distance in zip(indices[0], distances[0]):
+            if i < len(self.queries):
+                results.append({"query": self.queries[i], "score": float(distance)})
+        return results
+
+# Query Understanding Agent
+class QueryUnderstandingAgent:
+    def __init__(self, gsheet_url: str, semantic_layer_path: str):
+        # Google Sheets Setup
+        self.sheet = gc.open_by_url(gsheet_url)
+
+        # LLM and Embeddings
+        self.llm = ChatGoogleGenerativeAI(model="gemini-pro", temperature=0)
+        self.embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
+        self.vector_store = VectorStore(self.embeddings)
+        self.semantic_layer = load_semantic_layer(semantic_layer_path)
+        self.time_handler = TimeExpressionHandler()
+
+        # Initialize with example queries
+        example_queries = [
+            "What is the efficiency for JP in the week of 6th Jan 25?",
+            "Compare the efficiency for VID 12345 in April and May 2025",
+            "Which VIDs have efficiency below 60% this month?",
+            "Why is the efficiency low for VID 12345?",
+            "Show the trend of efficiency for JP over the past year",
+            "Is efficiency below 70% for any VID this month?",
+            "Summarize the efficiency for all VIDs in May 2025",
+            "How can we improve efficiency for VID 12345?"
+        ]
+        self.vector_store.add_queries(example_queries)
+
+    def extract_intent(self, query: str) -> List[str]:
+        prompt = f"""
+        Analyze the following user query and determine all possible intents from these options:
+        - fetch_metric: Retrieve a specific metric value
+        - compare_metric: Compare metric values
+        - rank_entities: Rank entities by a metric
+        - diagnose_metric: Diagnose/explain a metric's value
+        - trend_analysis: Analyze metric trends over time
+        - threshold_check: Check if a metric meets a threshold
+        - list_entities_by_criteria: List entities meeting criteria
+        - summarize_metric: Provide summary statistics
+        - get_recommendation: Suggest improvements
+        
+        Return a JSON array of intent names. If multiple intents are present, include all.
+
+        Query: "{query}"
+        Intents: """
+        
+        response = self.llm.invoke(prompt)
+        try:
+            intents = json.loads(response.content.strip())
+            return [IntentType[i.lower()] for i in intents if i.lower() in IntentType.__members__]
+        except json.JSONDecodeError:
+            return [IntentType["fetch_metric"]]  # Fallback
+
+    def extract_entities(self, query: str) -> Dict[str, Any]:
+        columns = self.semantic_layer["tables"]["efficiency_table"]["columns"]
+        metrics = list(self.semantic_layer["tables"]["efficiency_table"]["metrics"].keys())
+        semantic_map = {}
+        for col, info in columns.items():
+            for term in info.get("semantic", []):
+                semantic_map[term.lower()] = col
+            semantic_map[col.lower()] = col
+        for metric in metrics:
+            semantic_map[metric.lower()] = metric
+
+        prompt = f"""
+        Analyze the query and extract:
+        1. The metric (e.g., efficiency, C1_perc, SOH)
+        2. Entities (e.g., country, region, VID) and their filter values (e.g., JP, NA, 12345)
+        3. Entity type (country_code, region, vehicle_id, other)
+
+        Return as JSON: {{"metric": <metric>, "entities": {{"<entity_type>": {{"query_term": <term>, "data_field": <column>, "value": <value>, "value_type": <type>}}}}}
+
+        Metrics: {', '.join(metrics)} (to be calculated post-filtering)
+        Dimensions: {', '.join([k for k, v in columns.items() if v.get("dimension", False)])}
+        Query: "{query}"
+        """
+        
+        response = self.llm.invoke(prompt)
+        try:
+            result = json.loads(response.content)
+            if "metric" not in result:
+                result["metric"] = "efficiency"
+            if "entities" not in result:
+                result["entities"] = {}
+            return result
+        except json.JSONDecodeError:
+            return {"metric": "efficiency", "entities": {}}
+
+    def extract_timeframe(self, query: str) -> Dict[str, Any]:
+        time_expr = next((expr for expr in ["previous", "this week", "last week", "this month", "last month", "this year", "last year", "this quarter", "last quarter", "last 6 months", "last 2 months", "till now", "till date", "as of yesterday"] if expr in query.lower()), None)
+        if not time_expr:
+            month_match = re.search(r"(january|jan|february|feb|march|mar|april|apr|may|june|jun|july|jul|august|aug|september|sep|october|oct|november|nov|december|dec)\s+(\d{4})", query.lower())
+            if month_match:
+                time_expr = f"{month_match.group(1)} {month_match.group(2)}"
+        if time_expr:
+            parsed_time = self.time_handler.parse_time_expression(time_expr)
+            if parsed_time:
+                return {
+                    "timeframe_in_query": time_expr,
+                    "timeframe_in_data": {"start": parsed_time["start"], "end": parsed_time["end"]}
+                }
+        return {"timeframe_in_query": None, "timeframe_in_data": {"start": None, "end": None}}
+
+    def process(self, query: str) -> Dict[str, Any]:
+        intents = self.extract_intent(query)
+        entities_metrics = self.extract_entities(query)
+        timeframe = self.extract_timeframe(query)
+        similar_contexts = self.vector_store.search(query)
+
+        output = {
+            "intent": intents,
+            "user_query": query,
+            "extracted_context": {
+                "entity_in_query": next((info["query_term"] for info in entities_metrics["entities"].values()), "countries"),
+                "entity_in_data": next((info["data_field"] for info in entities_metrics["entities"].values()), "country_code"),
+                "filter_value": next((info["value"] for info in entities_metrics["entities"].values()), None),
+                "metric": entities_metrics["metric"],
+                "timeframe_in_query": timeframe["timeframe_in_query"],
+                "timeframe_in_data": timeframe["timeframe_in_data"]
+            },
+            "similar_contexts": [{"intent": intents[0], "query": q["query"]} for q in similar_contexts]
+        }
+        return output
+
+# LangGraph State and Nodes
+@dataclass
+class AgentState:
+    user_query: str
+    intent: Optional[List[str]] = None
+    extracted_context: Optional[Dict] = None
+    similar_contexts: Optional[List] = None
+    data: Optional[Any] = None
+    analysis_results: Optional[Dict] = None
+    report: Optional[str] = None
+
+def query_understanding_node(state: AgentState) -> Dict[str, Any]:
+    query_agent = QueryUnderstandingAgent(gsheet_url="https://docs.google.com/spreadsheets/d/your_sheet_url/edit#gid=0", semantic_layer_path="semantic_layer.yaml")
+    result = query_agent.process(state.user_query)
+    return {
+        "intent": result["intent"],
+        "extracted_context": result["extracted_context"],
+        "similar_contexts": result["similar_contexts"]
+    }
+
+# Initialize Workflow
+workflow = StateGraph(AgentState)
+workflow.add_node("query_understanding", query_understanding_node)
+workflow.set_entry_point("query_understanding")
+workflow.add_edge("query_understanding", END)
+app = workflow.compile()
+
+# Example Usage
+if __name__ == "__main__":
+    # Set environment variable for Gemini API key
+    import os
+    os.environ["GOOGLE_API_KEY"] = "your_gemini_api_key_here"
+
+    # Test query
+    state = AgentState(user_query="give me bottom 2 countries with low efficiency and tell me why? compare it with previous and give me report")
+    result = app.invoke(state)
+
+    # Print output
+    print(json.dumps(asdict(result), indent=2))
