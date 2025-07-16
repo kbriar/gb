@@ -1,0 +1,90 @@
+class DataRetrievalAgent:
+    def __init__(self, gsheet_url: str):
+        self.sheet = gc.open_by_url(gsheet_url)
+        self.worksheet = self.sheet.get_worksheet(0)  # Assume data is in the first worksheet
+
+    def fetch_data(self, extracted_context: Dict, intents: List[str]) -> Dict:
+        """
+        Fetch and filter data from Google Sheet based on extracted context and intents.
+        Calculate metrics after applying filters.
+        """
+        entity_in_data = extracted_context.get("entity_in_data", "country_code")
+        filter_value = extracted_context.get("filter_value")
+        metric = extracted_context.get("metric", "efficiency")
+        timeframe = extracted_context.get("timeframe_in_data", {"start": None, "end": None})
+
+        # Fetch all data from Google Sheet
+        data = self.worksheet.get_all_records()
+        df = pd.DataFrame(data)
+
+        # Convert date column to datetime
+        if "date" in df.columns:
+            df["date"] = pd.to_datetime(df["date"])
+
+        # Apply filters
+        filtered_df = df.copy()
+
+        # Filter by timeframe
+        if timeframe["start"] and timeframe["end"]:
+            start_date = pd.to_datetime(timeframe["start"])
+            end_date = pd.to_datetime(timeframe["end"])
+            filtered_df = filtered_df[
+                (filtered_df["date"] >= start_date) & (filtered_df["date"] <= end_date)
+            ]
+
+        # Filter by entity value (e.g., specific country_code)
+        if filter_value and entity_in_data in filtered_df.columns:
+            filtered_df = filtered_df[filtered_df[entity_in_data] == filter_value]
+
+        # Calculate metric (e.g., efficiency = value1 / value2 * 100)
+        if metric == "efficiency" and "value1" in filtered_df.columns and "value2" in filtered_df.columns:
+            filtered_df["efficiency"] = filtered_df["value1"] / filtered_df["value2"] * 100
+        # Add other metric calculations as needed
+        elif metric == "C1_perc":
+            filtered_df["C1_perc"] = filtered_df.get("C1_raw", 0) * 100
+        elif metric == "SOH":
+            filtered_df["SOH"] = filtered_df.get("SOH_raw", 0)
+
+        # Prepare data for each intent
+        data_output = {}
+        for intent in intents:
+            if intent == "rank_entities":
+                if entity_in_data in filtered_df.columns:
+                    ranked_data = filtered_df.groupby(entity_in_data)[metric].mean().reset_index()
+                    ranked_data = ranked_data.sort_values(by=metric, ascending=True)
+                    data_output["rank_entities"] = ranked_data.to_dict(orient="records")
+                else:
+                    data_output["rank_entities"] = []
+
+            elif intent == "diagnose_metric":
+                diag_data = filtered_df[[entity_in_data, metric, "value1", "value2"]].to_dict(orient="records")
+                data_output["diagnose_metric"] = diag_data
+
+            elif intent == "compare_metric":
+                current_data = filtered_df[[entity_in_data, metric, "date"]].to_dict(orient="records")
+                prev_start = (pd.to_datetime(timeframe["start"]) - timedelta(days=30)).strftime("%Y-%m-%d")
+                prev_end = (pd.to_datetime(timeframe["end"]) - timedelta(days=30)).strftime("%Y-%m-%d")
+                prev_df = df[(df["date"] >= prev_start) & (df["date"] <= prev_end)].copy()
+                if metric == "efficiency":
+                    prev_df["efficiency"] = prev_df["value1"] / prev_df["value2"] * 100
+                prev_data = prev_df[[entity_in_data, metric, "date"]].to_dict(orient="records")
+                data_output["compare_metric"] = {
+                    "current": current_data,
+                    "previous": prev_data
+                }
+
+        return data_output
+
+
+def data_retrieval_node(state: AgentState) -> Dict[str, Any]:
+    agent = DataRetrievalAgent(gsheet_url="https://docs.google.com/spreadsheets/d/your_sheet_url/edit#gid=0")
+    data = agent.fetch_data(state.extracted_context, state.intent)
+    return {"data": data}
+
+# Initialize Workflow
+workflow = StateGraph(AgentState)
+workflow.add_node("query_understanding", query_understanding_node)
+workflow.add_node("data_retrieval", data_retrieval_node)
+workflow.add_edge("query_understanding", "data_retrieval")
+workflow.add_edge("data_retrieval", END)
+app = workflow.compile()
