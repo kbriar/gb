@@ -1,0 +1,735 @@
+# === Notebook setup & utilities ===
+from google.colab import auth
+import gspread
+import yaml
+import numpy as np
+import pandas as pd
+import plotly.graph_objects as go
+from sentence_transformers import SentenceTransformer
+import faiss
+from langchain_google_genai import GoogleGenerativeAIEmbeddings, ChatGoogleGenerativeAI
+from langgraph.graph import StateGraph, END
+from langgraph.graph import START
+from dataclasses import dataclass, asdict
+import json
+from datetime import datetime, timedelta
+import re
+import os
+from typing import List, Dict, Any, Optional
+from enum import Enum
+from dateutil.relativedelta import relativedelta
+from google.colab import files
+import logging
+
+# Authenticate with Google
+auth.authenticate_user()
+from google.auth import default
+creds, _ = default()
+gc = gspread.authorize(creds)
+
+# Setup logging
+logging.basicConfig(filename='analysis_agent.log', level=logging.INFO,
+                    format='%(asctime)s - %(levelname)s - %(message)s')
+
+def load_config(file_path: str = 'config.yaml') -> dict:
+    """Load the configuration from a YAML file."""
+    with open(file_path, 'r') as file:
+        return yaml.safe_load(file)
+
+def load_semantic_layer(file_path: str = 'semantic_layer.yaml') -> dict:
+    """Load the semantic-layer definition from a YAML file."""
+    with open(file_path, 'r') as file:
+        return yaml.safe_load(file)
+
+class IntentType(Enum):
+    FETCH_METRIC = "fetch_metric"
+    COMPARE_METRIC = "compare_metric"
+    RANK_ENTITIES = "rank_entities"
+    DIAGNOSE_METRIC = "diagnose_metric"
+    TREND_ANALYSIS = "trend_analysis"
+    THRESHOLD_CHECK = "threshold_check"
+    LIST_ENTITIES_BY_CRITERIA = "list_entities_by_criteria"
+    SUMMARIZE_METRIC = "summarize_metric"
+    GET_RECOMMENDATION = "get_recommendation"
+    VISUALIZE_METRIC = "visualize_metric"
+
+@dataclass
+class AgentState:
+    user_query: str
+    intent: Optional[List[str]] = None
+    extracted_context: Optional[Dict] = None
+    similar_contexts: Optional[List] = None
+    data: Optional[pd.DataFrame] = None
+    analysis_results: Optional[Dict] = None
+    report: Optional[str] = None
+    timeframes: Optional[Dict] = None
+    errors: Optional[List[str]] = None
+    feedback: Optional[Dict] = None
+
+# === VectorStore with Learning ===
+class VectorStore:
+    def __init__(self, embeddings):
+        self.embeddings = embeddings
+        self.index = None
+        self.queries = []
+        self.query_history = []  # For learning and follow-up suggestions
+
+    def add_queries(self, queries: List[str]):
+        """Embed and index a batch of example queries."""
+        self.queries.extend(queries)
+        query_embeddings = self.embeddings.embed_documents(queries)
+        if self.index is None:
+            dim = len(query_embeddings[0])
+            self.index = faiss.IndexHNSWFlat(dim, 32)
+            self.index.add(np.array(query_embeddings).astype('float32'))
+        else:
+            self.index.add(np.array(query_embeddings).astype('float32'))
+        self.query_history.extend(queries)
+
+    def add_query(self, query: str):
+        """Add a new query for learning."""
+        if query not in self.queries:
+            self.queries.append(query)
+            query_embeddings = self.embeddings.embed_documents([query])
+            self.index.add(np.array(query_embeddings).astype('float32'))
+            self.query_history.append(query)
+            logging.info(f"Learned new query: {query}")
+
+    def search(self, query: str, k: int = 3) -> List[Dict[str, Any]]:
+        """Return the top-k most similar past queries."""
+        q_emb = self.embeddings.embed_query(query)
+        distances, indices = self.index.search(np.array([q_emb]).astype('float32'), k)
+        results = []
+        for idx, dist in zip(indices[0], distances[0]):
+            if idx < len(self.queries):
+                results.append({
+                    "query": self.queries[idx],
+                    "score": float(dist)
+                })
+        return results
+
+# === TimeExpressionHandler ===
+class TimeExpressionHandler:
+    def __init__(self):
+        self.now = datetime.now()  # Dynamic time for enterprise use
+
+    def parse_time_expression(self, expression: str, reference_date: Optional[datetime] = None) -> Optional[Dict[str, str]]:
+        if not reference_date:
+            reference_date = self.now
+        lower_expr = expression.lower().strip()
+        special_cases = {
+            "this week": lambda ref: {"start": (ref - timedelta(days=ref.weekday())).strftime("%Y-%m-%d"), "end": (ref + timedelta(days=(6 - ref.weekday()))).strftime("%Y-%m-%d")},
+            "last week": lambda ref: {"start": (ref - timedelta(days=ref.weekday() + 7)).strftime("%Y-%m-%d"), "end": (ref - timedelta(days=ref.weekday() + 1)).strftime("%Y-%m-%d")},
+            "this month": lambda ref: {"start": ref.replace(day=1).strftime("%Y-%m-%d"), "end": ((ref.replace(day=28) + timedelta(days=4)).replace(day=1) - timedelta(days=1)).strftime("%Y-%m-%d")},
+            "last month": lambda ref: {"start": (ref.replace(day=1) - timedelta(days=1)).replace(day=1).strftime("%Y-%m-%d"), "end": (ref.replace(day=1) - timedelta(days=1)).strftime("%Y-%m-%d")},
+            "this year": lambda ref: {"start": ref.replace(month=1, day=1).strftime("%Y-%m-%d"), "end": ref.replace(month=12, day=31).strftime("%Y-%m-%d")},
+            "last year": lambda ref: {"start": ref.replace(year=ref.year - 1, month=1, day=1).strftime("%Y-%m-%d"), "end": ref.replace(year=ref.year - 1, month=12, day=31).strftime("%Y-%m-%d")},
+            "this quarter": lambda ref: {"start": ref.replace(month=((ref.month - 1) // 3 * 3 + 1), day=1).strftime("%Y-%m-%d"), "end": (ref.replace(month=((ref.month - 1) // 3 * 3 + 4), day=1) - timedelta(days=1)).strftime("%Y-%m-%d")},
+            "last quarter": lambda ref: {"start": (ref.replace(month=((ref.month - 1) // 3 * 3 + 1), day=1) - timedelta(days=92)).replace(day=1).strftime("%Y-%m-%d"), "end": (ref.replace(month=((ref.month - 1) // 3 * 3 + 1), day=1) - timedelta(days=1)).strftime("%Y-%m-%d")},
+            "till now": lambda ref: {"start": "1970-01-01", "end": ref.strftime("%Y-%m-%d")},
+            "as of yesterday": lambda ref: {"start": "1970-01-01", "end": (ref - timedelta(days=1)).strftime("%Y-%m-%d")}
+        }
+        for expr, fn in special_cases.items():
+            if expr in lower_expr:
+                return fn(reference_date)
+        range_match = re.search(r'(?:last|past)\s+(\d+)\s+(month|months|year|years)', lower_expr)
+        if range_match:
+            num, unit = int(range_match.group(1)), range_match.group(2)
+            if unit.startswith("month"):
+                start = (reference_date.replace(day=1) - relativedelta(months=num)).replace(day=1)
+                end = ((reference_date.replace(day=28) + timedelta(days=4)).replace(day=1) - timedelta(days=1))
+            else:
+                start = reference_date.replace(year=reference_date.year - num, month=1, day=1)
+                end = reference_date.replace(month=12, day=31)
+            return {"start": start.strftime("%Y-%m-%d"), "end": end.strftime("%Y-%m-%d")}
+        month_match = re.search(r'(january|jan|february|feb|march|mar|april|apr|may|june|jun|july|jul|august|aug|september|sep|october|oct|november|nov|december|dec)\s+(\d{4})', lower_expr)
+        if month_match:
+            month_name, yr = month_match.group(1), int(month_match.group(2))
+            month_map = {"jan":1, "january":1, "feb":2, "february":2, "mar":3, "march":3, "apr":4, "april":4, "may":5, "jun":6, "june":6, "jul":7, "july":7, "aug":8, "august":8, "sep":9, "september":9, "oct":10, "october":10, "nov":11, "november":11, "dec":12, "december":12}
+            mnum = month_map[month_name]
+            start = datetime(yr, mnum, 1)
+            end = (start.replace(month=mnum % 12 + 1, day=1) - timedelta(days=1))
+            return {"start": start.strftime("%Y-%m-%d"), "end": end.strftime("%Y-%m-%d")}
+        logging.warning(f"No match found for time expression: {lower_expr}")
+        return {"start": None, "end": None}
+
+# === FeedbackCollector ===
+class FeedbackCollector:
+    def __init__(self, feedback_file: str = 'feedback.json'):
+        self.feedback_file = feedback_file
+        self.feedback_data = self._load_feedback()
+
+    def _load_feedback(self) -> Dict:
+        try:
+            with open(self.feedback_file, 'r') as f:
+                return json.load(f)
+        except FileNotFoundError:
+            return {"queries": [], "feedback": []}
+
+    def save_feedback(self):
+        with open(self.feedback_file, 'w') as f:
+            json.dump(self.feedback_data, f, indent=2)
+
+    def add_feedback(self, query: str, feedback: str):
+        self.feedback_data["queries"].append(query)
+        self.feedback_data["feedback"].append(feedback)
+        self.save_feedback()
+        logging.info(f"Added feedback for query: {query}, Feedback: {feedback}")
+
+    def get_feedback_insights(self) -> Dict:
+        if not self.feedback_data["feedback"]:
+            return {}
+        return {"common_issues": max(set(self.feedback_data["feedback"]), key=self.feedback_data["feedback"].count)}
+
+# === Query Understanding Agent ===
+class QueryUnderstandingAgent:
+    def __init__(self, gsheet_url: str, semantic_layer_path: str):
+        self.sheet = gc.open_by_url(gsheet_url)
+        self.llm = ChatGoogleGenerativeAI(model="gemini-1.5-flash", temperature=0.2)
+        self.embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
+        self.vector_store = VectorStore(self.embeddings)
+        self.semantic_layer = load_semantic_layer(semantic_layer_path)
+        self.time_handler = TimeExpressionHandler()
+        self.feedback_collector = FeedbackCollector()
+        example_queries = [
+            "What is the efficiency for JP in the week of 6th Jan 25?",
+            "Compare the efficiency for VID 12345 in April and May 2025",
+            "which VIDs have efficiency below 60% this month?",
+            "why is the efficiency low for VID 12345?",
+            "Show the trend of efficiency for JP over the past year",
+            "Is efficiency below 70% for any VID this month?",
+            "Summarize the efficiency for all VIDs in May 2025",
+            "How can we improve efficiency for VID 12345?"
+        ]
+        self.vector_store.add_queries(example_queries)
+
+    def extract_intent(self, query: str) -> List[str]:
+        query_lower = query.lower()
+        intents = []
+        if any(keyword in query_lower for keyword in ["what is"]):
+            intents.append(IntentType.FETCH_METRIC.value)
+        if any(keyword in query_lower for keyword in ["top", "bottom", "lowest", "highest", "best", "worst", "what are"]):
+            intents.append(IntentType.RANK_ENTITIES.value)
+        if any(keyword in query_lower for keyword in ["why", "reason", "cause", "explain", "how", "work", "diagnose", "root cause"]):
+            intents.append(IntentType.DIAGNOSE_METRIC.value)
+        if any(keyword in query_lower for keyword in ["compare", "versus", "vs", "comparison", "compared"]):
+            intents.append(IntentType.COMPARE_METRIC.value)
+        if any(keyword in query_lower for keyword in ["trend", "over time", "history", "previous", "last", "quarterly", "half yearly", "yearly"]):
+            intents.append(IntentType.TREND_ANALYSIS.value)
+        if any(keyword in query_lower for keyword in ["below", "above", "threshold", "check"]):  # Updated with "check" from feedback
+            intents.append(IntentType.THRESHOLD_CHECK.value)
+        if any(keyword in query_lower for keyword in ["summarize", "summarise", "summary", "conclusion", "finally", "conclude", "average", "overall"]):
+            intents.append(IntentType.SUMMARIZE_METRIC.value)
+        if any(keyword in query_lower for keyword in ["recommend", "improve", "predict", "how to", "optimize", "optimise"]):
+            intents.append(IntentType.GET_RECOMMENDATION.value)
+        if any(keyword in query_lower for keyword in ["plot", "draw", "visualise", "visualize", "show"]):
+            intents.append(IntentType.VISUALIZE_METRIC.value)
+        if intents:
+            return intents
+
+        prompt = f"""
+Analyze the following user query and determine all possible intents from these options using chain-of-thought reasoning. Break down your thought process step by step, then return a JSON array of intent names.
+Options:
+1. fetch_metric: Retrieve a specific metric value
+2. compare_metric: Compare metric values
+3. rank_entities: Rank entities by a metric
+4. diagnose_metric: Diagnose or explain a metric's value
+5. trend_analysis: Analyze metric trends over time
+6. threshold_check: Check if a metric meets a threshold
+7. list_entities_by_criteria: List entities meeting criteria
+8. summarize_metric: Provide summary statistics
+9. get_recommendation: Suggest improvements
+10. visualize_metric: Generate visualizations and plots
+Query: "{query}"
+Thought Process: [Your step-by-step reasoning here]
+Intents:
+"""
+        response = self.llm.invoke(prompt)
+        try:
+            content = response.content.strip()
+            intents_start = content.find("Intents:") + len("Intents:")
+            intents_json = content[intents_start:].strip()
+            if intents_json.startswith("[") and intents_json.endswith("]"):
+                intents = json.loads(intents_json)
+                return [IntentType(intents_str.lower()).value for intents_str in intents if intents_str.lower() in IntentType._value2member_map_]
+            return [IntentType.FETCH_METRIC.value]
+        except json.JSONDecodeError:
+            logging.error(f"JSON decode error for intent extraction: {response.content}")
+            return [IntentType.FETCH_METRIC.value]
+        except ValueError:
+            logging.error(f"Value error for intent extraction: {response.content}")
+            return [IntentType.FETCH_METRIC.value]
+
+    def extract_entities(self, query: str) -> Dict[str, Any]:
+        columns = self.semantic_layer["tables"]["efficiency_table"]["columns"]
+        metrics = list(self.semantic_layer["metrics"].keys())
+        semantic_map = {}
+        for col, info in columns.items():
+            for term in info.get("semantic", []):
+                semantic_map[term.lower()] = col
+            semantic_map[col.lower()] = col
+        for metric in metrics:
+            semantic_map[metric.lower()] = metric
+
+        prompt = f"""
+Analyze the query and extract:
+1. The metric (e.g., efficiency, c1_km_perc, SOH)
+2. Entities (e.g., country, region, VID) and their filter values (e.g., 'JP', 'NA', 12345)
+3. Entity type (country_code, region, vehicle_id, other)
+4. Date field is drive_date in the data. If any time-related term appears, map entity_in_data to drive_date.
+5. If a country name is detected, map entity_in_data to country_code with a two-letter code (e.g., 'Japan' -> 'JP').
+6. Map region names: Asia Pacific -> APAC, Europe Africa -> EMEA, Latin America -> LATAM, North America -> NA.
+7. For queries like 'all countries in a region', map entity_in_data to country_code and filter_value to all relevant country codes.
+Return as JSON: {{'metrics': [<metric1>, <metric2>, ...], 'entities': [{{'entity_type': <type>, 'query_term': <term>, 'data_field': <column>, 'value': <value>, 'value_type': <type>}}, ...]}}
+Metrics: {', '.join(metrics)}
+Dimensions: {', '.join(k for k, v in columns.items() if v.get("dimension", False))}
+Query: "{query}"
+"""
+        response = self.llm.invoke(prompt)
+        cleaned_response = response.content.strip()
+        if cleaned_response.startswith("```json"):
+            cleaned_response = cleaned_response[7:-3].strip()
+        elif cleaned_response.startswith("```"):
+            cleaned_response = cleaned_response[3:-3].strip()
+        try:
+            result = json.loads(cleaned_response)
+            if "metrics" not in result:
+                result["metrics"] = ["efficiency"]
+            if "entities" not in result:
+                result["entities"] = []
+            return result
+        except json.JSONDecodeError:
+            logging.error(f"JSON decode error for entity extraction: {response.content}")
+            return {"metrics": ["efficiency"], "entities": []}
+
+    def extract_timeframe(self, query: str) -> List[Dict[str, Any]]:
+        sentences = re.split(r'[.?]', query)
+        timeframes = []
+        time_exprs = ["this week", "last week", "this month", "last month", "this year", "last year", "this quarter", "last quarter", "last 6 months", "last 2 months", "till now", "as of yesterday"]
+        reference_date = self.time_handler.now
+        for sentence in sentences:
+            if not sentence.strip():
+                continue
+            intents = self.extract_intent(sentence)
+            month_matches = list(re.finditer(r"(january|jan|february|feb|march|mar|april|apr|may|june|jun|july|jul|august|aug|september|sep|october|oct|november|nov|december|dec)\s+(\d{4})", sentence))
+            for month_match in month_matches:
+                time_expr = month_match.group(0)
+                parsed_time = self.time_handler.parse_time_expression(time_expr, reference_date)
+                if parsed_time["start"] and parsed_time["end"]:
+                    timeframes.append({"timeframe_in_query": time_expr, "timeframe_in_data": parsed_time, "intent": intents})
+            range_matches = list(re.finditer(r"(?:last|past)\s+(\d+)\s+(month|months|year|years)", sentence.lower()))
+            for range_match in range_matches:
+                time_expr = range_match.group(0)
+                parsed_time = self.time_handler.parse_time_expression(time_expr, reference_date)
+                if parsed_time["start"] and parsed_time["end"]:
+                    timeframes.append({"timeframe_in_query": time_expr, "timeframe_in_data": parsed_time, "intent": intents})
+            for expr in time_exprs:
+                if expr in sentence.lower():
+                    parsed_time = self.time_handler.parse_time_expression(expr, reference_date)
+                    if parsed_time["start"] and parsed_time["end"]:
+                        timeframes.append({"timeframe_in_query": expr, "timeframe_in_data": parsed_time, "intent": intents})
+        if not timeframes:
+            return [{"timeframe_in_query": None, "timeframe_in_data": {"start": None, "end": None}, "intent": intents}]
+        return timeframes
+
+    def process(self, query: str) -> Dict[str, Any]:
+        intents = self.extract_intent(query)
+        entities_metrics = self.extract_entities(query)
+        timeframes = self.extract_timeframe(query)
+        similar_contexts = self.vector_store.search(query)
+        feedback_insights = self.feedback_collector.get_feedback_insights()
+        if feedback_insights:
+            for issue in feedback_insights.get("common_issues", []):
+                if "intent misclassification" in issue.lower():
+                    intents = self._refine_intents_with_feedback(intents, query)
+
+        extracted_context = {
+            "entity_in_query": [info["query_term"] for info in entities_metrics["entities"]] if entities_metrics.get("entities") else ["countries"],
+            "entity_in_data": [info["data_field"] for info in entities_metrics["entities"]] if entities_metrics.get("entities") else ["country_code"],
+            "filter_value": [info["value"] for info in entities_metrics["entities"]] if entities_metrics.get("entities") else ["NA"],
+            "metrics": {intent: entities_metrics["metrics"][0] if entities_metrics.get("metrics") else "efficiency" for intent in intents},
+            "timeframes": {t["timeframe_in_query"]: {"start": t["timeframe_in_data"]["start"], "end": t["timeframe_in_data"]["end"], "intent": t["intent"]} for t in timeframes}
+        }
+
+        output = {
+            "intent": intents,
+            "user_query": query,
+            "extracted_context": extracted_context,
+            "similar_contexts": [{"intent": self.extract_intent(q["query"]), "query": q["query"]} for q in similar_contexts]
+        }
+        self.vector_store.add_query(query)  # Query pattern learning
+        return output
+
+    def _refine_intents_with_feedback(self, intents: List[str], query: str) -> List[str]:
+        feedback_insights = self.feedback_collector.get_feedback_insights()
+        if feedback_insights.get("common_issues"):
+            prompt = f"""
+Refine intents based on feedback. Current intents: {intents}. Query: {query}. Common feedback issues: {feedback_insights['common_issues']}. Suggest corrected intents using chain-of-thought reasoning, then return a JSON array.
+Thought Process: [Your reasoning here]
+Intents:
+"""
+            response = self.llm.invoke(prompt)
+            try:
+                content = response.content.strip()
+                intents_start = content.find("Intents:") + len("Intents:")
+                intents_json = content[intents_start:].strip()
+                if intents_json.startswith("[") and intents_json.endswith("]"):
+                    refined_intents = json.loads(intents_json)
+                    return [IntentType(intent.lower()).value for intent in refined_intents if intent.lower() in IntentType._value2member_map_]
+            except json.JSONDecodeError:
+                logging.error(f"JSON decode error in intent refinement: {response.content}")
+        return intents
+
+# === Data Retrieval Agent ===
+class DataRetrievalAgent:
+    def __init__(self, gsheet_url: str):
+        self.sheet = gc.open_by_url(gsheet_url)
+        self.worksheets = {sheet.title: sheet for sheet in self.sheet.worksheets()}  # Multi-sheet support
+
+    def fetch_data(self, extracted_context: Dict[str, Any]) -> pd.DataFrame:
+        worksheet = self.worksheets.get("efficiency_data", self.sheet.get_worksheet(0))  # Default to first sheet
+        data = worksheet.get_all_records()
+        df = pd.DataFrame(data)
+        logging.info(f"Initial DataFrame shape: {df.shape}")
+
+        if "drive_date" not in df.columns:
+            logging.error("drive_date column missing in data")
+            return pd.DataFrame()
+        df["drive_date"] = pd.to_datetime(df["drive_date"], errors='coerce')
+
+        start_dates = [pd.to_datetime(t["start"]) for t in extracted_context["timeframes"].values() if t["start"]]
+        end_dates = [pd.to_datetime(t["end"]) for t in extracted_context["timeframes"].values() if t["end"]]
+        start_date = min(start_dates) if start_dates else None
+        end_date = max(end_dates) if end_dates else None
+
+        if start_date and end_date:
+            df = df[(df["drive_date"] >= start_date) & (df["drive_date"] <= end_date)]
+
+        entity_filters = []
+        for i in range(len(extracted_context["entity_in_data"])):
+            entity_in_data = extracted_context["entity_in_data"][i]
+            filter_value = extracted_context["filter_value"][i]
+            if entity_in_data in df.columns and filter_value:
+                if entity_in_data == "country_code" or entity_in_data == "region":
+                    entity_filters.append(f"{entity_in_data} == @filter_value")
+                else:
+                    entity_filters.append(f"{entity_in_data} == '{filter_value}'")
+
+        if entity_filters:
+            try:
+                df = df.query(" and ".join(entity_filters))
+            except Exception as e:
+                logging.error(f"Filter query failed: {str(e)}")
+                return pd.DataFrame()
+
+        if not df.empty:
+            df["intent"] = df["drive_date"].apply(
+                lambda x: list({
+                    intent
+                    for timeframe in extracted_context["timeframes"].values()
+                    for intent in timeframe["intent"]
+                    if pd.to_datetime(timeframe["start"], errors='coerce') <= x <= pd.to_datetime(timeframe["end"], errors='coerce')
+                })
+            )
+        return df
+
+# === Analysis Agents ===
+class Agent:
+    def process(self, df: pd.DataFrame, intent: List[str], context: Dict = None) -> Dict[str, Any]:
+        raise NotImplementedError("Subclasses must implement process()")
+
+class MetricCalculator(Agent):
+    def __init__(self, semantic_layer):
+        self.metrics = semantic_layer.get("metrics", {})
+
+    def process(self, df: pd.DataFrame, intent: List[str], context: Dict = None) -> Dict[str, Any]:
+        df["drive_date"] = pd.to_datetime(df["drive_date"], errors='coerce')
+        df["drive_month"] = pd.to_datetime(df["drive_month"], errors='coerce', unit='M', origin='1970-01-01')
+        for metric, config in self.metrics.items():
+            formula = config.get("formula")
+            columns = config.get("columns", [])
+            if all(col in df.columns for col in columns):
+                try:
+                    if "sum" in formula.lower():
+                        numerator = df[columns[0]].sum() if len(columns) > 0 else 0
+                        denominator = df[columns[1]].sum() if len(columns) > 1 else 1
+                        df[metric] = numerator / denominator if denominator else 0
+                    elif "mean" in formula.lower():
+                        df[metric] = df[columns[0]].mean()
+                    elif "min" in formula.lower():
+                        df[metric] = df[columns[0]].min()
+                    elif "max" in formula.lower():
+                        df[metric] = df[columns[0]].max()
+                except Exception as e:
+                    logging.error(f"Metric calculation failed for {metric}: {str(e)}")
+                    df[metric] = np.nan
+        return {"data": df}
+
+class InsightGenerator(Agent):
+    def process(self, df: pd.DataFrame, intent: List[str], context: Dict = None) -> Dict[str, Any]:
+        metrics = context.get("metrics", {}) if context else {}
+        try:
+            for row_intent in df["intent"].iloc[0] if not df.empty else []:
+                if row_intent in intent:
+                    metric = metrics.get(row_intent, next(iter(metrics.values()), "efficiency"))
+                    if metric in df.columns:
+                        if row_intent == "fetch_metric":
+                            return {"summary": f"Value of {metric}: {df[metric].mean():.2f}"}
+                        elif row_intent == "compare_metric" and "drive_date" in df.columns:
+                            comparison = df.groupby(df["drive_date"].dt.to_period("M"))[metric].mean().to_dict()
+                            return {"summary": f"Comparison of {metric}", "data": comparison}
+                        elif row_intent == "rank_entities":
+                            ranking = df.groupby("vehicle_id")[metric].mean().sort_values(ascending=False).head(5).to_dict()
+                            return {"summary": f"Top 5 by {metric}", "data": ranking}
+                        elif row_intent == "threshold_check":
+                            below_threshold = df[df[metric] < 0.7]["vehicle_id"].unique().tolist()
+                            return {"summary": f"Vehicle IDs with {metric} < 70%: {below_threshold}"}
+                        elif row_intent == "list_entities_by_criteria":
+                            criteria_met = df[df[metric] < 0.7]["vehicle_id"].unique().tolist()
+                            return {"summary": f"Entities with {metric} < 0.7: {criteria_met}"}
+                        elif row_intent == "summarize_metric":
+                            summary = {f"{metric}_{stat}": df[metric].agg(stat) for stat in ["mean", "min", "max"]}
+                            return {"summary": f"Summary of {metric}", "data": summary}
+                        elif row_intent == "trend_analysis" and "drive_date" in df.columns:
+                            trend = df.groupby(df["drive_date"].dt.to_period("M"))[metric].mean().to_dict()
+                            return {"summary": f"Trend for {metric}", "data": trend}
+        except Exception as e:
+            logging.error(f"Insight generation failed: {str(e)}")
+            return {"error": str(e)}
+        return {}
+
+class PatternDetector(Agent):
+    def process(self, df: pd.DataFrame, intent: List[str], context: Dict = None) -> Dict[str, Any]:
+        metrics = context.get("metrics", {}) if context else {}
+        llm = ChatGoogleGenerativeAI(model="gemini-pro", temperature=0.1)
+        try:
+            for row_intent in df["intent"].iloc[0] if not df.empty else []:
+                if row_intent in intent and row_intent == "diagnose_metric":
+                    metric = metrics.get(row_intent, next(iter(metrics.values()), "efficiency"))
+                    if metric in df.columns:
+                        correlations = {col: df[col].corr(df[metric]) for col in ["C1_Kms_Collected", "C2_Kms_Collected", "C3_Kms_Collected"] if col in df.columns}
+                        prompt = f"""
+Perform chain-of-thought reasoning to diagnose why {metric} is low. Data correlations: {correlations}. Step-by-step:
+1. Identify the strongest negative correlation.
+2. Hypothesize a causal relationship.
+3. Suggest a verification step.
+Thought Process: [Your reasoning here]
+Diagnosis:
+"""
+                        response = llm.invoke(prompt)
+                        diagnosis = response.content.strip().split("Diagnosis:")[1].strip() if "Diagnosis:" in response.content else "Unable to determine cause."
+                        return {"hidden_insights": [diagnosis]}
+        except Exception as e:
+            logging.error(f"Pattern detection failed: {str(e)}")
+            return {"error": str(e)}
+        return {}
+
+class PlotGenerator(Agent):
+    def process(self, df: pd.DataFrame, intent: List[str], context: Dict = None) -> Dict[str, Any]:
+        metrics = context.get("metrics", {}) if context else {}
+        try:
+            for row_intent in df["intent"].iloc[0] if not df.empty else []:
+                if row_intent in intent and row_intent == "visualize_metric" and "drive_date" in df.columns:
+                    metric = metrics.get(row_intent, next(iter(metrics.values()), "efficiency"))
+                    if metric in df.columns:
+                        fig = go.Figure()
+                        fig.add_trace(go.Scatter(x=df["drive_date"], y=df[metric], mode="lines"))
+                        fig.update_layout(title=f"{metric} Trend", xaxis_title="Date", yaxis_title=metric)
+                        fig.show()
+                        return {"plot": f"Interactive {metric} plot displayed in canvas"}
+        except Exception as e:
+            logging.error(f"Plot generation failed: {str(e)}")
+            return {"error": str(e)}
+        return {}
+
+class RecommendationEngine(Agent):
+    def process(self, df: pd.DataFrame, intent: List[str], context: Dict = None) -> Dict[str, Any]:
+        metrics = context.get("metrics", {}) if context else {}
+        try:
+            for row_intent in df["intent"].iloc[0] if not df.empty else []:
+                if row_intent in intent and row_intent == "get_recommendation":
+                    metric = metrics.get(row_intent, next(iter(metrics.values()), "efficiency"))
+                    if metric in df.columns and df[metric].min() < 0.7:
+                        return {"recommendations": [f"Optimize {metric} for low-performing VIDs by reviewing TKM and Total_KM.", f"Consider maintenance checks for vehicles with {metric} < 0.7."]}
+        except Exception as e:
+            logging.error(f"Recommendation failed: {str(e)}")
+            return {"error": str(e)}
+        return {}
+
+# === Analysis Workflow ===
+def validate_intents(state: AgentState) -> Dict[str, Any]:
+    if state.data is not None and not state.data.empty:
+        df_intents = set().union(*state.data["intent"])
+        state_intents = set(state.intent or [])
+        if df_intents != state_intents:
+            mismatch = list(state_intents - df_intents)
+            return {"errors": [f"Intent mismatch: {mismatch} not found in DataFrame intents {df_intents}"]}
+    return {}
+
+def metric_calculation_node(state: AgentState) -> Dict[str, Any]:
+    return {
+        "data": MetricCalculator(load_semantic_layer()).process(state.data, state.intent, state.extracted_context)["data"],
+        **validate_intents(state)
+    }
+
+def create_analysis_nodes(config: dict, llm: ChatGoogleGenerativeAI):
+    graph = StateGraph(AgentState)
+    graph.add_node("metric_calculation", metric_calculation_node)
+
+    agents = {
+        "MetricCalculator": MetricCalculator(load_semantic_layer()),
+        "InsightGenerator": InsightGenerator(),
+        "PatternDetector": PatternDetector(),
+        "PlotGenerator": PlotGenerator(),
+        "RecommendationEngine": RecommendationEngine()
+    }
+
+    def error_handling_node(state: AgentState) -> Dict[str, Any]:
+        if state.errors:
+            llm_prompt = f"Handle errors: {json.dumps(state.errors)}. Suggest fixes or fallback actions based on user_query: {state.user_query} and intents: {state.intent}. Return JSON with 'fix' and 'message' fields."
+            response = llm.invoke(llm_prompt)
+            try:
+                fix_data = json.loads(response.content.strip())
+                state.feedback = {"query": state.user_query, "feedback": f"Applied fix: {fix_data['fix']}"}
+                state.feedback_collector.add_feedback(state.user_query, fix_data['message'])
+                state.report = f"Errors occurred: {state.errors}\nLLM Fix: {fix_data['message']}\n{state.report or ''}"
+                state.errors = []
+            except json.JSONDecodeError:
+                logging.error(f"JSON decode error in error handling: {response.content}")
+                state.report = f"Errors occurred: {state.errors}\n{state.report or ''}"
+                state.errors = []
+        return state
+
+    for agent_name in agents:
+        graph.add_node(agent_name.lower(), lambda state, agent=agents[agent_name]: {
+            **agents[agent_name].process(state.data, state.intent, state.extracted_context),
+            "data": state.data
+        })
+
+    agent_mapping = config.get("agent_mapping", {})
+    for intent in IntentType.__dict__.values():
+        if intent and isinstance(intent, str):
+            next_nodes = agent_mapping.get(intent, [])
+            if next_nodes:
+                for node in next_nodes:
+                    graph.add_conditional_edges("metric_calculation", lambda x, intent=intent: node.lower() if intent in x.intent else None, [node.lower()])
+                    graph.add_edge(node.lower(), "error_handling")
+
+    graph.add_node("error_handling", error_handling_node)
+    graph.add_conditional_edges("error_handling", lambda state: "report_generation" if not state.errors else END, ["report_generation"])
+    graph.add_node("report_generation", lambda state: {
+        "report": llm.invoke(f"""
+Compile a professional report with: {json.dumps(state.analysis_results or {})}. Enhance with similar_contexts: {json.dumps(state.similar_contexts or [])} and query history: {json.dumps(state.vector_store.query_history[-5:] if state.vector_store.query_history else [])}.
+Suggest follow-up questions based on the analysis, similar contexts, and history using chain-of-thought reasoning. Include the thought process.
+Thought Process: [Your reasoning here]
+Report:
+Follow-up Questions:
+""").content.strip().split("Follow-up Questions:")[1].strip() if "Follow-up Questions:" in llm.invoke(f"""
+Compile a professional report with: {json.dumps(state.analysis_results or {})}. Enhance with similar_contexts: {json.dumps(state.similar_contexts or [])} and query history: {json.dumps(state.vector_store.query_history[-5:] if state.vector_store.query_history else [])}.
+Suggest follow-up questions based on the analysis, similar contexts, and history using chain-of-thought reasoning. Include the thought process.
+Thought Process: [Your reasoning here]
+Report:
+Follow-up Questions:
+""").content else "Report compilation failed." + f"\nFollow-up Questions: Check trends for other regions?"
+    })
+    graph.add_edge("report_generation", END)
+    graph.set_entry_point("metric_calculation")
+    return graph.compile()
+
+# === Full Workflow ===
+def query_understanding_node(state: AgentState) -> Dict[str, Any]:
+    query_agent = QueryUnderstandingAgent(
+        gsheet_url="https://docs.google.com/spreadsheets/d/1auyXukmp19gTl0p0TrdJXbx18oHM0V8HB1O-a9UwzXE/edit?resourcekey=0-Y7TxpGkjJnTY2bEA3vS-bg&gid=1808",
+        semantic_layer_path="semantic_layer.yaml"
+    )
+    result = query_agent.process(state.user_query)
+    return {
+        "intent": result["intent"],
+        "extracted_context": result["extracted_context"],
+        "similar_contexts": result["similar_contexts"],
+    }
+
+def data_retrieval_node(state: AgentState) -> Dict[str, Any]:
+    agent = DataRetrievalAgent(
+        gsheet_url="https://docs.google.com/spreadsheets/d/1auyXukmp19gTl0p0TrdJXbx18oHM0V8HB1O-a9UwzXE/edit?resourcekey=0-Y7TxpGkjJnTY2bEA3vS-bg&gid=1808"
+    )
+    data = agent.fetch_data(state.extracted_context)
+    return {"data": data}
+
+workflow = StateGraph(AgentState)
+workflow.add_node("query_understanding", query_understanding_node)
+workflow.add_node("data_retrieval", data_retrieval_node)
+workflow.add_node("analysis", lambda state: {
+    "intent": state.intent,
+    "extracted_context": state.extracted_context,
+    "data": state.data,
+    "timeframes": state.timeframes,
+    "similar_contexts": state.similar_contexts,
+    **create_analysis_nodes(load_config(), ChatGoogleGenerativeAI(model="gemini-pro", temperature=0)).invoke(state)
+})
+workflow.set_entry_point("query_understanding")
+workflow.add_edge("query_understanding", "data_retrieval")
+workflow.add_edge("data_retrieval", "analysis")
+workflow.add_edge("analysis", END)
+
+app = workflow.compile()
+
+# === Example Usage ===
+if __name__ == "__main__":
+    os.environ["GOOGLE_API_KEY"] = "your-google-api-key"
+
+    # Semantic Layer
+    semantic_layer = {
+        "tables": {"efficiency_table": {"columns": {
+            "region": {"dimension": True, "semantic": ["region", "area"]},
+            "country_code": {"dimension": True, "semantic": ["country", "nation"]},
+            "vehicle_id": {"dimension": True, "semantic": ["vid", "vehicle"]},
+            "drive_date": {"dimension": True, "semantic": ["date", "day"]},
+            "drive_month": {"dimension": True, "semantic": ["month"]},
+            "TKM": {"measure": True},
+            "Total_KM": {"measure": True},
+            "C1_Kms_Collected": {"measure": True},
+            "C2_Kms_Collected": {"measure": True},
+            "C3_Kms_Collected": {"measure": True}
+        }}},
+        "metrics": {
+            "efficiency": {"formula": "sum(TKM) / sum(Total_KM)", "columns": ["TKM", "Total_KM"]},
+            "c1_km_perc": {"formula": "sum(C1_Kms_Collected) / sum(Total_KM)", "columns": ["C1_Kms_Collected", "Total_KM"]}
+        }
+    }
+    with open("semantic_layer.yaml", "w") as f:
+        yaml.dump(semantic_layer, f)
+
+    # Config
+    config = {
+        "agent_mapping": {
+            "fetch_metric": ["InsightGenerator"],
+            "compare_metric": ["InsightGenerator"],
+            "rank_entities": ["InsightGenerator"],
+            "diagnose_metric": ["PatternDetector"],
+            "trend_analysis": ["InsightGenerator", "PatternDetector"],
+            "threshold_check": ["InsightGenerator"],
+            "list_entities_by_criteria": ["InsightGenerator"],
+            "summarize_metric": ["InsightGenerator"],
+            "get_recommendation": ["RecommendationEngine"],
+            "visualize_metric": ["PlotGenerator"]
+        }
+    }
+    with open("config.yaml", "w") as f:
+        yaml.dump(config, f)
+
+    # Sample Data
+    sample_df = pd.read_csv("sample_efficiency_data.csv")  # Assume a CSV with the above columns
+    sample_df["drive_date"] = pd.to_datetime(sample_df["drive_date"])
+    sample_df["drive_month"] = pd.to_datetime(sample_df["drive_month"])
+
+    state = AgentState(user_query="What is the c1_km_perc for country JP in May 2025? Plot the trend of efficiency in region APAC for past 3 months")
+    result = app.invoke(state)
+    result_to_print = {k: v for k, v in result.items() if k != "data" and k != "feedback"}
+    print(json.dumps(result_to_print, indent=2))
+    if result.get("data") is not None:
+        display(result.get("data"))
+    if result.get("report"):
+        print(result["report"])
+    if result.get("feedback"):
+        print(f"Feedback applied: {result['feedback']}")
