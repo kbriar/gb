@@ -1,0 +1,530 @@
+# === Notebook setup & utilities ===
+from google.colab import auth
+import gspread
+import yaml
+import numpy as np
+import pandas as pd
+import plotly.graph_objects as go
+from sentence_transformers import SentenceTransformer
+import faiss
+from langchain_google_genai import GoogleGenerativeAIEmbeddings, ChatGoogleGenerativeAI
+from langgraph.graph import StateGraph, END
+from langgraph.graph import START
+from dataclasses import dataclass, asdict, field
+import json
+from datetime import datetime, timedelta
+import re
+import os
+from typing import List, Dict, Any, Optional, Annotated
+from enum import Enum
+from dateutil.relativedelta import relativedelta
+import logging
+from operator import add
+
+# Authenticate and authorize
+auth.authenticate_user()
+from google.auth import default
+creds, _ = default()
+gc = gspread.authorize(creds)
+
+# Logging
+logging.basicConfig(filename='agentic_app.log', level=logging.INFO,
+                    format='%(asctime)s - %(levelname)s - %(message)s')
+
+def load_config(file_path: str = 'config.yaml') -> dict:
+    with open(file_path, 'r') as file:
+        return yaml.safe_load(file)
+
+def load_semantic_layer(file_path: str = 'semantic_layer.yaml') -> dict:
+    with open(file_path, 'r') as file:
+        return yaml.safe_load(file)
+
+class IntentType(Enum):
+    FETCH_METRIC = "fetch_metric"
+    COMPARE_METRIC = "compare_metric"
+    RANK_ENTITIES = "rank_entities"
+    THRESHOLD_CHECK = "threshold_check"
+    LIST_ENTITIES_BY_CRITERIA = "list_entities_by_criteria"
+    DIAGNOSE_METRIC = "diagnose_metric"
+    TREND_ANALYSIS = "trend_analysis"
+    SUMMARIZE_METRIC = "summarize_metric"
+    GET_RECOMMENDATION = "get_recommendation"
+    VISUALIZE_METRIC = "visualize_metric"
+    PREDICT_METRIC = "predict_metric"
+    CORRELATE_METRICS = "correlate_metrics"
+    ANOMALY_DETECTION = "anomaly_detection"
+    GROUP_AGGREGATE = "group_aggregate"
+    FILTER_LIST = "filter_list"
+    EXPORT_DATA = "export_data"
+    GENERATE_REPORT = "generate_report"
+
+@dataclass
+class AgentState:
+    user_query: str
+    intent: Optional[List[str]] = None
+    extracted_context: Optional[Dict] = None
+    similar_contexts: Optional[List] = None
+    data: Optional[pd.DataFrame] = None
+    analysis_results: Optional[Dict] = None
+    all_analysis_results: Annotated[list, add] = field(default_factory=list)
+    report: Optional[str] = None
+    timeframes: Optional[Dict] = None
+    errors: Optional[List[str]] = field(default_factory=list)
+    feedback: Optional[Dict] = None
+
+# === VectorStore ===
+class VectorStore:
+    def __init__(self, embeddings):
+        self.embeddings = embeddings
+        self.index = None
+        self.queries = []
+        self.query_history = []
+
+    def add_queries(self, queries: List[str]):
+        self.queries.extend(queries)
+        query_embeddings = self.embeddings.embed_documents(queries)
+        if self.index is None:
+            dim = len(query_embeddings[0])
+            self.index = faiss.IndexHNSWFlat(dim, 32)
+            self.index.add(np.array(query_embeddings).astype('float32'))
+        else:
+            self.index.add(np.array(query_embeddings).astype('float32'))
+        self.query_history.extend(queries)
+
+    def add_query(self, query: str):
+        if query not in self.queries:
+            self.queries.append(query)
+            query_embeddings = self.embeddings.embed_documents([query])
+            self.index.add(np.array(query_embeddings).astype('float32'))
+            self.query_history.append(query)
+            logging.info(f"Learned new query: {query}")
+
+    def search(self, query: str, k: int = 3) -> List[Dict[str, Any]]:
+        q_emb = self.embeddings.embed_query(query)
+        distances, indices = self.index.search(np.array([q_emb]).astype('float32'), k)
+        results = []
+        for idx, dist in zip(indices[0], distances[0]):
+            if idx < len(self.queries):
+                results.append({
+                    "query": self.queries[idx],
+                    "intent": self.extract_intent(self.queries[idx]) if hasattr(self, 'extract_intent') else [],
+                    "score": float(dist)
+                })
+        return results
+
+# === TimeExpressionHandler ===
+class TimeExpressionHandler:
+    def __init__(self):
+        self.now = datetime.now()  # 2025-07-31 06:19 PM IST
+
+    def parse_time_expression(self, expression: str, reference_date: Optional[datetime] = None) -> Optional[Dict[str, str]]:
+        if not reference_date:
+            reference_date = self.now
+        lower_expr = expression.lower().strip()
+        special_cases = {
+            "this week": lambda ref: {"start": (ref - timedelta(days=ref.weekday())).strftime("%Y-%m-%d"), "end": (ref + timedelta(days=(6 - ref.weekday()))).strftime("%Y-%m-%d")},
+            "last week": lambda ref: {"start": (ref - timedelta(days=ref.weekday() + 7)).strftime("%Y-%m-%d"), "end": (ref - timedelta(days=ref.weekday() + 1)).strftime("%Y-%m-%d")},
+            "this month": lambda ref: {"start": ref.replace(day=1).strftime("%Y-%m-%d"), "end": ((ref.replace(day=28) + timedelta(days=4)).replace(day=1) - timedelta(days=1)).strftime("%Y-%m-%d")},
+            "last month": lambda ref: {"start": (ref.replace(day=1) - timedelta(days=1)).replace(day=1).strftime("%Y-%m-%d"), "end": (ref.replace(day=1) - timedelta(days=1)).strftime("%Y-%m-%d")},
+            "this year": lambda ref: {"start": ref.replace(month=1, day=1).strftime("%Y-%m-%d"), "end": ref.replace(month=12, day=31).strftime("%Y-%m-%d")},
+            "last year": lambda ref: {"start": ref.replace(year=ref.year - 1, month=1, day=1).strftime("%Y-%m-%d"), "end": ref.replace(year=ref.year - 1, month=12, day=31).strftime("%Y-%m-%d")},
+            "this quarter": lambda ref: {"start": ref.replace(month=((ref.month - 1) // 3 * 3 + 1), day=1).strftime("%Y-%m-%d"), "end": (ref.replace(month=((ref.month - 1) // 3 * 3 + 4), day=1) - timedelta(days=1)).strftime("%Y-%m-%d")},
+            "last quarter": lambda ref: {"start": (ref.replace(month=((ref.month - 1) // 3 * 3 + 1), day=1) - timedelta(days=92)).replace(day=1).strftime("%Y-%m-%d"), "end": (ref.replace(month=((ref.month - 1) // 3 * 3 + 1), day=1) - timedelta(days=1)).strftime("%Y-%m-%d")},
+            "till now": lambda ref: {"start": "1970-01-01", "end": ref.strftime("%Y-%m-%d")},
+            "as of yesterday": lambda ref: {"start": "1970-01-01", "end": (ref - timedelta(days=1)).strftime("%Y-%m-%d")}
+        }
+        for expr, fn in special_cases.items():
+            if expr in lower_expr:
+                return fn(reference_date)
+        range_match = re.search(r'(?:last|past)\s+(\d+)\s+(month|months|year|years)', lower_expr)
+        if range_match:
+            num, unit = int(range_match.group(1)), range_match.group(2)
+            if unit.startswith("month"):
+                start = (reference_date.replace(day=1) - relativedelta(months=num)).replace(day=1)
+                end = ((reference_date.replace(day=28) + timedelta(days=4)).replace(day=1) - timedelta(days=1))
+            else:
+                start = reference_date.replace(year=reference_date.year - num, month=1, day=1)
+                end = reference_date.replace(month=12, day=31)
+            return {"start": start.strftime("%Y-%m-%d"), "end": end.strftime("%Y-%m-%d")}
+        month_match = re.search(r'(january|jan|february|feb|march|mar|april|apr|may|june|jun|july|jul|august|aug|september|sep|october|oct|november|nov|december|dec)\s+(\d{4})', lower_expr)
+        if month_match:
+            month_name, yr = month_match.group(1), int(month_match.group(2))
+            month_map = {"jan":1, "january":1, "feb":2, "february":2, "mar":3, "march":3, "apr":4, "april":4, "may":5, "jun":6, "june":6, "jul":7, "july":7, "aug":8, "august":8, "sep":9, "september":9, "oct":10, "october":10, "nov":11, "november":11, "dec":12, "december":12}
+            mnum = month_map.get(month_name.lower(), 1)
+            start = datetime(yr, mnum, 1)
+            end = (start.replace(month=mnum % 12 + 1, day=1) - timedelta(days=1))
+            return {"start": start.strftime("%Y-%m-%d"), "end": end.strftime("%Y-%m-%d")}
+        logging.warning(f"No match for time expression: {lower_expr}")
+        return {"start": "1970-01-01", "end": reference_date.strftime("%Y-%m-%d")}
+
+# === FeedbackCollector ===
+class FeedbackCollector:
+    def __init__(self, feedback_file: str = 'feedback.json'):
+        self.feedback_file = feedback_file
+        self.feedback_data = self._load_feedback()
+
+    def _load_feedback(self) -> Dict:
+        try:
+            with open(self.feedback_file, 'r') as f:
+                return json.load(f)
+        except FileNotFoundError:
+            return {"queries": [], "feedback": []}
+
+    def save_feedback(self):
+        with open(self.feedback_file, 'w') as f:
+            json.dump(self.feedback_data, f, indent=2)
+
+    def add_feedback(self, query: str, feedback: str):
+        self.feedback_data["queries"].append(query)
+        self.feedback_data["feedback"].append(feedback)
+        self.save_feedback()
+        logging.info(f"Added feedback for query: {query}")
+
+    def get_feedback_insights(self) -> Dict:
+        if not self.feedback_data["feedback"]:
+            return {}
+        return {"common_issues": max(set(self.feedback_data["feedback"]), key=self.feedback_data["feedback"].count)}
+
+# === Query Understanding Agent ===
+class QueryUnderstandingAgent:
+    def __init__(self, gsheet_url: str, semantic_layer_path: str):
+        self.llm = ChatGoogleGenerativeAI(model="gemini-1.5-flash", temperature=0.2)
+        self.embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
+        self.vector_store = VectorStore(self.embeddings)
+        self.semantic_layer = load_semantic_layer(semantic_layer_path)
+        self.time_handler = TimeExpressionHandler()
+        self.feedback_collector = FeedbackCollector()
+        example_queries = [
+            "What is the efficiency for JP in the week of 6th Jan 25?",
+            "Compare the efficiency for VID 12345 in April and May 2025",
+            "which VIDs have efficiency below 60% this month?",
+            "why is the efficiency low for VID 12345?",
+            "Show the trend of efficiency for JP over the past year",
+            "Is efficiency below 70% for any VID this month?",
+            "Summarize the efficiency for all VIDs in May 2025",
+            "How can we improve efficiency for VID 12345?"
+        ]
+        self.vector_store.add_queries(example_queries)
+
+    def extract_intent(self, query: str) -> List[str]:
+        query_lower = query.lower()
+        intents = []
+        if any(keyword in query_lower for keyword in ["what is", "fetch", "get value"]):
+            intents.append(IntentType.FETCH_METRIC.value)
+        if any(keyword in query_lower for keyword in ["compare", "versus", "vs", "comparison"]):
+            intents.append(IntentType.COMPARE_METRIC.value)
+        if any(keyword in query_lower for keyword in ["top", "bottom", "rank", "highest", "lowest"]):
+            intents.append(IntentType.RANK_ENTITIES.value)
+        if any(keyword in query_lower for keyword in ["below", "above", "threshold", "check"]):
+            intents.append(IntentType.THRESHOLD_CHECK.value)
+        if any(keyword in query_lower for keyword in ["list", "which", "what are"]):
+            intents.append(IntentType.LIST_ENTITIES_BY_CRITERIA.value)
+        if any(keyword in query_lower for keyword in ["why", "diagnose", "explain", "cause"]):
+            intents.append(IntentType.DIAGNOSE_METRIC.value)
+        if any(keyword in query_lower for keyword in ["trend", "over time", "history"]):
+            intents.append(IntentType.TREND_ANALYSIS.value)
+        if any(keyword in query_lower for keyword in ["summarize", "summary", "average"]):
+            intents.append(IntentType.SUMMARIZE_METRIC.value)
+        if any(keyword in query_lower for keyword in ["recommend", "improve", "optimize"]):
+            intents.append(IntentType.GET_RECOMMENDATION.value)
+        if any(keyword in query_lower for keyword in ["visualize", "plot", "show"]):
+            intents.append(IntentType.VISUALIZE_METRIC.value)
+        if any(keyword in query_lower for keyword in ["predict", "forecast"]):
+            intents.append(IntentType.PREDICT_METRIC.value)
+        if any(keyword in query_lower for keyword in ["correlate", "relationship", "how does"]):
+            intents.append(IntentType.CORRELATE_METRICS.value)
+        if any(keyword in query_lower for keyword in ["anomaly", "unusual", "detect"]):
+            intents.append(IntentType.ANOMALY_DETECTION.value)
+        if any(keyword in query_lower for keyword in ["aggregate", "group", "by"]):
+            intents.append(IntentType.GROUP_AGGREGATE.value)
+        if any(keyword in query_lower for keyword in ["filter", "which with"]):
+            intents.append(IntentType.FILTER_LIST.value)
+        if any(keyword in query_lower for keyword in ["export", "download"]):
+            intents.append(IntentType.EXPORT_DATA.value)
+        if any(keyword in query_lower for keyword in ["report", "generate report"]):
+            intents.append(IntentType.GENERATE_REPORT.value)
+        if intents:
+            return intents
+
+        prompt = f"""
+Analyze the query and determine all possible intents from these options using chain-of-thought reasoning. Return a JSON array of intent names.
+Options: {[i.value for i in IntentType]}
+Thought Process: [Identify keywords, infer intent, resolve overlaps with context]
+Query: "{query}"
+Intents:
+"""
+        response = self.llm.invoke(prompt)
+        try:
+            content = response.content.strip()
+            intents_start = content.find("Intents:") + len("Intents:")
+            intents_json = content[intents_start:].strip()
+            return json.loads(intents_json)
+        except json.JSONDecodeError:
+            logging.error(f"JSON decode error in intent extraction: {response.content}")
+            return [IntentType.FETCH_METRIC.value]
+
+    def extract_entities(self, query: str) -> Dict[str, Any]:
+        columns = self.semantic_layer["tables"]["efficiency_table"]["columns"]
+        metrics = list(self.semantic_layer["metrics"].keys())
+        semantic_map = {}
+        for col, info in columns.items():
+            for term in info.get("semantic", []):
+                semantic_map[term.lower()] = col
+            semantic_map[col.lower()] = col
+        for metric in metrics:
+            semantic_map[metric.lower()] = metric
+
+        prompt = f"""
+Analyze the query and extract:
+1. Metrics (e.g., efficiency, c1_km_perc)
+2. Entities (e.g., country_code='JP', region='APAC', vehicle_id=12345) as multiple dicts if multiple.
+3. Map to data fields using semantic map.
+Return JSON: {{"metrics": [<metric1>], "entities": [{{"field": <data_field>, "value": <value>}}, ...]}}
+Semantic map: {json.dumps(semantic_map)}
+Query: "{query}"
+"""
+        response = self.llm.invoke(prompt)
+        cleaned_response = response.content.strip().replace("```json", "").replace("```", "").strip()
+        try:
+            result = json.loads(cleaned_response)
+            if "metrics" not in result:
+                result["metrics"] = ["efficiency"]
+            if "entities" not in result:
+                result["entities"] = []
+            return result
+        except json.JSONDecodeError:
+            logging.error(f"JSON decode error in entity extraction: {response.content}")
+            return {"metrics": ["efficiency"], "entities": []}
+
+    def extract_timeframe(self, query: str, intents: List[str]) -> List[Dict[str, Any]]:
+        sentences = re.split(r'[.?]', query)
+        timeframes = []
+        time_exprs = ["this week", "last week", "this month", "last month", "this year", "last year", "this quarter", "last quarter", "last 6 months", "last 2 months", "till now", "as of yesterday"]
+        reference_date = self.time_handler.now
+        for sentence in sentences:
+            if not sentence.strip():
+                continue
+            sentence_intents = self.extract_intent(sentence)
+            month_matches = list(re.finditer(r"(january|jan|february|feb|march|mar|april|apr|may|june|jun|july|jul|august|aug|september|sep|october|oct|november|nov|december|dec)\s+(\d{4})", sentence.lower()))
+            for month_match in month_matches:
+                time_expr = month_match.group(0)
+                parsed_time = self.time_handler.parse_time_expression(time_expr, reference_date)
+                if parsed_time and 'start' in parsed_time and parsed_time['start']:
+                    for intent in sentence_intents:
+                        timeframes.append({"period_in_query": time_expr, "start": parsed_time["start"], "end": parsed_time["end"], "intent_ref": intent})
+            range_matches = list(re.finditer(r"(?:last|past)\s+(\d+)\s+(month|months|year|years)", sentence.lower()))
+            for range_match in range_matches:
+                time_expr = range_match.group(0)
+                parsed_time = self.time_handler.parse_time_expression(time_expr, reference_date)
+                if parsed_time and 'start' in parsed_time and parsed_time['start']:
+                    for intent in sentence_intents:
+                        timeframes.append({"period_in_query": time_expr, "start": parsed_time["start"], "end": parsed_time["end"], "intent_ref": intent})
+            for expr in time_exprs:
+                if expr in sentence.lower():
+                    parsed_time = self.time_handler.parse_time_expression(expr, reference_date)
+                    if parsed_time and 'start' in parsed_time and parsed_time['start']:
+                        for intent in sentence_intents:
+                            timeframes.append({"period_in_query": expr, "start": parsed_time["start"], "end": parsed_time["end"], "intent_ref": intent})
+        if not timeframes:
+            timeframes = [{"period_in_query": "all data", "start": "1970-01-01", "end": reference_date.strftime("%Y-%m-%d"), "intent_ref": intent} for intent in intents]
+        return timeframes
+
+    def process(self, query: str) -> Dict[str, Any]:
+        intents = self.extract_intent(query)
+        entities_metrics = self.extract_entities(query)
+        timeframes = self.extract_timeframe(query, intents)
+        similar_contexts = self.vector_store.search(query)
+        extracted_context = []
+        for intent in intents:
+            intent_timeframes = [t for t in timeframes if t["intent_ref"] == intent]
+            extracted_context.append({
+                "intent": intent,
+                "metrics": entities_metrics.get("metrics", ["efficiency"]),
+                "entities": entities_metrics.get("entities", []),
+                "timeframes": intent_timeframes
+            })
+        extracted_context_global = {
+            "entity_in_query": [e.get("query_term", e["value"]) for ctx in extracted_context for e in ctx["entities"]],
+            "entity_in_data": [e["field"] for ctx in extracted_context for e in ctx["entities"]],
+            "filter_value": [e["value"] for ctx in extracted_context for e in ctx["entities"]]
+        }
+        output = {
+            "user_query": query,
+            "intents": intents,
+            "extracted_context": extracted_context,
+            "extracted_context_global": extracted_context_global,
+            "similar_contexts": similar_contexts
+        }
+        self.vector_store.add_query(query)
+        return output
+
+# === Data Retrieval Agent (Updated to filter values, no metric computation) ===
+class DataRetrievalAgent:
+    def __init__(self, gsheet_url: str):
+        self.gsheet_url = gsheet_url
+        self.semantic_layer = load_semantic_layer('semantic_layer.yaml')
+
+    def fetch_data(self, extracted_context: Dict[str, Any]) -> pd.DataFrame:
+        try:
+            sheet = gc.open_by_url(self.gsheet_url)
+            worksheet = sheet.get_worksheet(0)
+            data = worksheet.get_all_records()
+            df = pd.DataFrame(data)
+            logging.info(f"Initial DataFrame shape: {df.shape}")
+        except Exception as e:
+            logging.error(f"Sheet access error: {str(e)}")
+            df = pd.read_csv("combined_vehicle_data.csv")  # Fallback
+            logging.info("Fell back to CSV data")
+
+        df["drive_date"] = pd.to_datetime(df["drive_date"], errors='coerce')
+        df["drive_month"] = df["drive_date"].dt.to_period("M").dt.to_timestamp()
+
+        # Unified timeframe
+        all_starts = [pd.to_datetime(t["start"]) for ctx in extracted_context["extracted_context"] for t in ctx["timeframes"] if t["start"]]
+        all_ends = [pd.to_datetime(t["end"]) for ctx in extracted_context["extracted_context"] for t in ctx["timeframes"] if t["end"]]
+        start_date = min(all_starts) if all_starts else pd.to_datetime("1970-01-01")
+        end_date = max(all_ends) if all_ends else datetime.now()
+        df = df[(df["drive_date"] >= start_date) & (df["drive_date"] <= end_date)]
+
+        # Apply value-based filters per intent
+        intent_filters = []
+        for ctx in extracted_context["extracted_context"]:
+            intent = ctx["intent"]
+            entities = ctx["entities"]
+            if entities:
+                conditions = []
+                for entity in entities:
+                    field, value = entity["field"], entity["value"]
+                    if isinstance(value, (int, float)):
+                        conditions.append(f"`{field}` == {value}")
+                    else:
+                        conditions.append(f"`{field}` == '{value}'")
+                # Handle multiple entities with OR for same field, AND across fields
+                if conditions:
+                    intent_filters.append((intent, " or ".join(conditions) if len(entities) > 1 and all(e["field"] == entities[0]["field"] for e in entities) else " and ".join(conditions)))
+
+        # Tag rows with intents based on filters
+        df["intent"] = [[]] * len(df)  # Initialize empty list for each row
+        for intent, condition in intent_filters:
+            mask = df.eval(condition) if condition else pd.Series([True] * len(df))
+            df.loc[mask, "intent"] = df.loc[mask, "intent"].apply(lambda x: x + [intent] if intent not in x else x)
+
+        return df
+
+# === Tools (Updated to compute metrics post-retrieval) ===
+def compute_metric(df: pd.DataFrame, metric: str, semantic_layer: Dict, intent_filter: List[str] = None) -> pd.DataFrame:
+    if intent_filter:
+        df = df[df['intent'].apply(lambda x: any(i in x for i in intent_filter))]
+    if metric == "efficiency":
+        df[metric] = df.groupby('intent').apply(lambda g: g["TKM"].sum() / g["Total_KM"].sum() if g["Total_KM"].sum() > 0 else 0).reindex(df.index).fillna(0)
+    elif metric == "c1_km_perc":
+        df[metric] = df.groupby('intent').apply(lambda g: g["C1_Kms_Collected"].sum() / (g["C1_Kms_Collected"].sum() + g["C2_Kms_Collected"].sum() + g["C3_Kms_Collected"].sum()) if (g["C1_Kms_Collected"].sum() + g["C2_Kms_Collected"].sum() + g["C3_Kms_Collected"].sum()) > 0 else 0).reindex(df.index).fillna(0)
+    return df
+
+def generate_plot(df: pd.DataFrame, metric: str, intent_filter: List[str] = None) -> str:
+    if intent_filter:
+        df = df[df['intent'].apply(lambda x: any(i in x for i in intent_filter))]
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=df["drive_date"], y=df[metric] if metric in df else df["efficiency"], mode="lines"))
+    fig.update_layout(title=f"{metric} Trend", xaxis_title="Date", yaxis_title=metric)
+    fig.show()
+    return "Plot generated and displayed"
+
+def predict_metric(df: pd.DataFrame, metric: str, days_ahead: int = 30, intent_filter: List[str] = None) -> Dict:
+    if intent_filter:
+        df = df[df['intent'].apply(lambda x: any(i in x for i in intent_filter))]
+    recent = df.sort_values("drive_date").tail(90)  # Approx 3 months
+    if len(recent) > 1 and metric in recent:
+        coeffs = np.polyfit(recent.index, recent[metric], 1)
+        last_date = recent["drive_date"].max()
+        future_date = last_date + timedelta(days=days_ahead)
+        prediction = np.polyval(coeffs, len(df) + days_ahead)
+        return {"prediction": prediction, "date": future_date.strftime("%Y-%m-%d")}
+    return {"prediction": df[metric].mean() if metric in df else df["efficiency"].mean(), "date": (df["drive_date"].max() + timedelta(days=days_ahead)).strftime("%Y-%m-%d")}
+
+# === Orchestrator (Manager Agent) ===
+class OrchestratorAgent:
+    def __init__(self, llm):
+        self.llm = llm
+        self.tools = {
+            "compute_metric": compute_metric,
+            "generate_plot": generate_plot,
+            "predict_metric": predict_metric
+        }
+        self.semantic_layer = load_semantic_layer('semantic_layer.yaml')
+
+    def process(self, state: AgentState) -> Dict[str, Any]:
+        prompt = f"""
+Given query: {state.user_query}, intents: {state.intent}, context: {state.extracted_context}.
+Plan steps: use retrieved data, then call tools for intents (e.g., compute_metric for fetch/summarize with intent filter, generate_plot for visualize, predict_metric for predict).
+Return JSON plan with 'steps': [{{'tool': 'name', 'args': {{'metric': <metric>, 'intent_filter': <intent_list>, 'days_ahead': <days>}}}}]
+"""
+        try:
+            response = self.llm.invoke(prompt)
+            plan = json.loads(response.content.strip())
+            for step in plan.get("steps", []):
+                tool_name = step["tool"]
+                args = step["args"]
+                if tool_name in self.tools:
+                    if tool_name == "compute_metric":
+                        state.data = self.tools[tool_name](state.data, args.get("metric", "efficiency"), self.semantic_layer, args.get("intent_filter", state.intent))
+                    elif tool_name == "generate_plot":
+                        result = self.tools[tool_name](state.data, args.get("metric", "efficiency"), args.get("intent_filter", state.intent))
+                        state.analysis_results = {"plot": result}
+                    elif tool_name == "predict_metric":
+                        result = self.tools[tool_name](state.data, args.get("metric", "efficiency"), args.get("days_ahead", 30), args.get("intent_filter", state.intent))
+                        state.analysis_results = {"prediction": result}
+            if state.data is not None:
+                state.analysis_results = {"summary": f"Data shape: {state.data.shape}, intents applied: {state.intent}"}
+        except json.JSONDecodeError:
+            logging.error(f"Plan parse error: {response.content}")
+            state.errors.append("Failed to parse orchestrator plan")
+        return state
+
+# === Full Workflow ===
+workflow = StateGraph(AgentState)
+workflow.add_node("query_understanding", lambda state: {"extracted_context": QueryUnderstandingAgent(gsheet_url="YOUR_SHEET_URL_HERE", semantic_layer_path="semantic_layer.yaml").process(state.user_query)})
+workflow.add_node("data_retrieval", lambda state: {"data": DataRetrievalAgent(gsheet_url="YOUR_SHEET_URL_HERE").fetch_data(state.extracted_context)})
+workflow.add_node("orchestrator", lambda state: OrchestratorAgent(ChatGoogleGenerativeAI(model="gemini-1.5-flash", temperature=0.2)).process(state))
+workflow.set_entry_point("query_understanding")
+workflow.add_edge("query_understanding", "data_retrieval")
+workflow.add_edge("data_retrieval", "orchestrator")
+workflow.add_edge("orchestrator", END)
+
+app = workflow.compile()
+
+# === Config with Full Tool Mappings ===
+if __name__ == "__main__":
+    os.environ["GOOGLE_API_KEY"] = "your-google-api-key-here"
+    config = {
+        "agent_mapping": {
+            "fetch_metric": ["compute_metric"],
+            "compare_metric": ["compute_metric"],
+            "rank_entities": ["compute_metric"],
+            "threshold_check": ["compute_metric"],
+            "list_entities_by_criteria": ["compute_metric"],
+            "diagnose_metric": ["compute_metric"],
+            "trend_analysis": ["compute_metric"],
+            "summarize_metric": ["compute_metric"],
+            "get_recommendation": ["compute_metric"],
+            "visualize_metric": ["generate_plot"],
+            "predict_metric": ["predict_metric"],
+            "correlate_metrics": ["compute_metric"],
+            "anomaly_detection": ["compute_metric"],
+            "group_aggregate": ["compute_metric"],
+            "filter_list": ["compute_metric"],
+            "export_data": [],  # Custom export tool needed
+            "generate_report": []  # Custom report tool needed
+        }
+    }
+    with open("config.yaml", "w") as f:
+        yaml.dump(config, f)
+
+    state = AgentState(user_query="What is the efficiency for JP in Jan 2025? And get me SOH greater than 20 for NA in Jan 2025.")
+    result = app.invoke(state)
+    result_to_print = {k: v for k, v in result.items() if k != "data" and k != "feedback"}
+    print(json.dumps(result_to_print, indent=2))
+    if result.get("data") is not None:
+        print(result["data"])
+    if result.get("analysis_results"):
+        print("Analysis Results:", result["analysis_results"])
