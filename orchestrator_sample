@@ -1,0 +1,172 @@
+class OrchestratorAgent:
+    def __init__(self, gsheet_url: str, semantic_layer_path: str, api_key: str):
+        os.environ["GOOGLE_API_KEY"] = api_key
+        self.llm = ChatGoogleGenerativeAI(model="gemini-1.5-flash", temperature=0.2)
+        self.query_agent = QueryUnderstandingAgent(gsheet_url, semantic_layer_path)
+        self.data_agent = DataRetrievalAgent(gsheet_url)
+        self.analysis_agent = AnalysisAgent(self.llm, load_semantic_layer(semantic_layer_path))
+        self.tools = {
+            IntentType.FETCH_METRIC.value: lambda data, args: self.analysis_agent.dispatch(IntentType.FETCH_METRIC.value, data, args),
+            IntentType.COMPARE_METRIC.value: lambda data, args: self.analysis_agent.dispatch(IntentType.COMPARE_METRIC.value, data, args),
+            IntentType.RANK_ENTITIES.value: lambda data, args: self.analysis_agent.dispatch(IntentType.RANK_ENTITIES.value, data, args),
+            IntentType.THRESHOLD_CHECK.value: lambda data, args: self.analysis_agent.dispatch(IntentType.THRESHOLD_CHECK.value, data, args),
+            IntentType.LIST_ENTITIES_BY_CRITERIA.value: lambda data, args: self.analysis_agent.dispatch(IntentType.LIST_ENTITIES_BY_CRITERIA.value, data, args),
+            IntentType.DIAGNOSE_METRIC.value: lambda data, args: self.analysis_agent.dispatch(IntentType.DIAGNOSE_METRIC.value, data, args),
+            IntentType.TREND_ANALYSIS.value: lambda data, args: self.analysis_agent.dispatch(IntentType.TREND_ANALYSIS.value, data, args),
+            IntentType.SUMMARIZE_METRIC.value: lambda data, args: self.analysis_agent.dispatch(IntentType.SUMMARIZE_METRIC.value, data, args),
+            IntentType.GET_RECOMMENDATION.value: lambda data, args: self.analysis_agent.dispatch(IntentType.GET_RECOMMENDATION.value, data, args),
+            IntentType.VISUALIZE_METRIC.value: lambda data, args: self.analysis_agent.dispatch(IntentType.VISUALIZE_METRIC.value, data, args),
+            IntentType.PREDICT_METRIC.value: lambda data, args: self.analysis_agent.dispatch(IntentType.PREDICT_METRIC.value, data, args),
+            IntentType.CORRELATE_METRICS.value: lambda data, args: self.analysis_agent.dispatch(IntentType.CORRELATE_METRICS.value, data, args),
+            IntentType.ANOMALY_DETECTION.value: lambda data, args: self.analysis_agent.dispatch(IntentType.ANOMALY_DETECTION.value, data, args),
+            IntentType.GROUP_AGGREGATE.value: lambda data, args: self.analysis_agent.dispatch(IntentType.GROUP_AGGREGATE.value, data, args),
+            IntentType.FILTER_LIST.value: lambda data, args: self.analysis_agent.dispatch(IntentType.FILTER_LIST.value, data, args),
+            IntentType.EXPORT_DATA.value: lambda data, args: self.analysis_agent.dispatch(IntentType.EXPORT_DATA.value, data, args),
+            IntentType.GENERATE_REPORT.value: lambda data, args: self.analysis_agent.dispatch(IntentType.GENERATE_REPORT.value, data, args)
+        }
+        self.intent_tool_mapping = {
+            intent.value: [intent.value] for intent in IntentType
+        }  # Default mapping, can be overridden by config if provided
+
+    def generate_plan(self, state: AgentState) -> List[Dict]:
+        insights = self.query_agent.feedback_collector.learn_from_feedback()
+        prompt = f"""
+Given query: {state.user_query}, intents: {state.intent}, context: {state.extracted_context}.
+Past feedback summary (adapt to avoid mistakes): {insights}.
+Plan steps: use retrieved data, then call tools for each intent based on mapping {self.intent_tool_mapping}. 
+Multiple tools can be used per intent (e.g., compute_metric then generate_plot for compare_metric). 
+Return JSON plan with 'steps': [{'intent': <intent>, 'tools': [{'tool': 'name', 'args': {'metric': <metric>, 'intent_filter': <intent_list>, 'days_ahead': <days>}}]}]
+"""
+        for attempt in range(4):
+            response = self.llm.invoke(prompt)
+            try:
+                return json.loads(response.content.strip())
+            except json.JSONDecodeError as e:
+                logging.warning(f"JSON parse error on attempt {attempt + 1}: {str(e)}. Retrying...")
+                prompt += " Ensure the response is valid JSON."
+        default_intents = [ctx['intent'] for ctx in state.extracted_context.get('query_analysis', [])]
+        return [{"intent": intent, "tools": [{"tool": intent, "args": {"metric": "efficiency", "intent_filter": [intent]}}]} for intent in default_intents]
+
+    def execute_tool(self, tool_name: str, args: Dict, data: pd.DataFrame = None) -> Dict:
+        if tool_name in self.tools:
+            try:
+                return self.tools[tool_name](data or args.get("data", None), args)
+            except Exception as e:
+                logging.error(f"Error executing {tool_name}: {str(e)}")
+                return {"error": f"Execution failed: {str(e)}"}
+        return {"error": f"Unknown tool: {tool_name}"}
+
+    def process(self, state: AgentState) -> AgentState:
+        # Step 1: Understand the query
+        state.extracted_context = self.query_agent.process(state.user_query)
+        
+        # Step 2: Retrieve data
+        state.data = self.data_agent.fetch_data(state.extracted_context)
+        
+        # Step 3: Generate and execute plan based on intents
+        if state.data is None:
+            state.errors = ["Data retrieval failed"]
+            return state
+        plan = self.generate_plan(state)
+        analysis_results = {}
+        for step in plan:
+            intent = step["intent"]
+            for tool_step in step["tools"]:
+                tool_name = tool_step["tool"]
+                args = tool_step["args"]
+                args["data"] = state.data
+                result = self.execute_tool(tool_name, args)
+                if "error" not in result:
+                    if intent not in analysis_results:
+                        analysis_results[intent] = {}
+                    analysis_results[intent][tool_name] = result
+        
+        state.analysis_results = analysis_results
+        
+        # Step 4: Generate report
+        report_parts = []
+        for intent, tool_results in analysis_results.items():
+            report_parts.append(f"**{intent.replace('_', ' ').title()}:**")
+            for tool_name, res in tool_results.items():
+                report_parts.append(f"  - {tool_name.replace('_', ' ').title()}: {res.get('summary', str(res))}")
+                if 'table' in res:
+                    report_parts.append(res['table'])
+                if 'plot' in res:
+                    report_parts.append(f"    [Plot: {res['plot']}]")
+                if 'prediction' in res:
+                    report_parts.append(f"    Prediction: {res['prediction']} on {res.get('date', '')}")
+                if 'report' in res:
+                    report_parts.append(f"    Report: {res['report']}")
+        state.report = '\n\n'.join(report_parts) if report_parts else "No analysis results to report."
+        
+        # Integrate FeedbackCollector: Add programmatic feedback
+        programmatic_feedback = "Processed successfully" if not state.errors else "Error occurred: " + ', '.join(state.errors)
+        self.query_agent.feedback_collector.add_feedback(state.user_query, programmatic_feedback, "programmatic")
+        
+        # Collect user feedback to enable learning
+        user_feedback = self.query_agent.feedback_collector.collect_user_feedback(state.user_query)
+        if user_feedback and any(word in user_feedback.lower() for word in ["error", "wrong", "inaccurate", "missing"]):
+            self.query_agent.vector_store.add_query(f"Bad example: {state.user_query} - Feedback: {user_feedback}")
+        
+        # Append feedback insights to report
+        insights = self.query_agent.feedback_collector.get_feedback_insights()
+        if insights:
+            state.report += '\n\n**Feedback Insights:** ' + json.dumps(insights)
+        
+        return state
+
+    async def process_real_time(self, state: AgentState, interval_seconds=60):
+        while True:
+            updated_state = self.process(state)
+            yield updated_state
+            await asyncio.sleep(interval_seconds)
+
+def main():
+    os.environ["GOOGLE_API_KEY"] = "your-actual-google-api-key-here"  # Update with your actual API key
+    
+    # Config with only agent_mapping
+    config = {
+        "agent_mapping": {
+            "fetch_metric": ["fetch_metric"],
+            "compare_metric": ["compare_metric", "visualize_metric"],
+            "rank_entities": ["rank_entities"],
+            "threshold_check": ["threshold_check"],
+            "list_entities_by_criteria": ["list_entities_by_criteria"],
+            "diagnose_metric": ["diagnose_metric"],
+            "trend_analysis": ["trend_analysis", "visualize_metric"],
+            "summarize_metric": ["summarize_metric"],
+            "get_recommendation": ["get_recommendation"],
+            "visualize_metric": ["visualize_metric"],
+            "predict_metric": ["predict_metric"],
+            "correlate_metrics": ["correlate_metrics"],
+            "anomaly_detection": ["anomaly_detection"],
+            "group_aggregate": ["group_aggregate"],
+            "filter_list": ["filter_list"],
+            "export_data": ["export_data"],
+            "generate_report": ["generate_report"]
+        }
+    }
+    with open("config.yaml", "w") as f:
+        yaml.dump(config, f)
+    
+    gsheet_url = "https://docs.google.com/spreadsheets/d/1auyXukmp19gTl0p0TrdJXbx18oHM0V8HB1O-a9UwzXE/edit?resourcekey=0-Y7TxpGkjJnTY2bEA3vS-bg&gid=1808"
+    semantic_layer_path = "semantic_layer.yaml"
+    api_key = os.getenv("GOOGLE_API_KEY")
+    
+    orchestrator = OrchestratorAgent(gsheet_url, semantic_layer_path, api_key)
+    
+    state = AgentState(user_query="What is the c1_km_perc for country JP in May 2025? Plot the trend of efficiency in region APAC for past 3 months")
+    result = orchestrator.process(state)
+    
+    print("Query Analysis:", json.dumps({"intent": result.intent, "extracted_context": result.extracted_context, "similar_contexts": result.similar_contexts}, indent=2))
+    if result.data is not None:
+        display(result.data)  # Colab display
+    if result.analysis_results:
+        print("Analysis Results:", json.dumps(result.analysis_results, indent=2))
+    if result.report:
+        print("Report:\n", result.report)
+    if result.feedback:
+        print(f"Feedback applied: {result.feedback}")
+
+if __name__ == "__main__":
+    main()
